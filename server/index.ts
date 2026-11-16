@@ -13,7 +13,13 @@
  *   POST /api/set/place                   trial by default ("trial: not sent");
  *                                         live only when LIVE_TRADING=true, ticket <= MAX_LIVE_TICKET_USD
  *                                         and symbol is BTCUSDT or ETHUSDT
+ *   GET  /api/sets                        every Set in the ledger with its status and its own profit
  *   GET  /api/health                      mode and which settings are present (no values)
+ *
+ * Many Sets at once (2026-11-16): live Sets are recorded in a Set ledger
+ * (src/core/ledger.ts), kept here in logs/set-ledger.json. This demo server has no Aster
+ * user data stream, so it never calls handleOrderUpdate or reconcileSymbol
+ * (server/execute.ts); Blackboard's backend does (README "Many Sets at once").
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
@@ -26,7 +32,8 @@ import { seededRandom, type LeverageBracket, type OrderBookDepth, type RandomSou
 import { AsterClient, privateKeySigner } from "../src/exchange/aster";
 import { HyperliquidLevelSource, coinFromSymbol, type LevelsReport } from "../src/levels/hyperliquid";
 import { ConfigError, describeConfig, loadConfig } from "./config";
-import { executeLive, planToSetLegs } from "./execute";
+import { describeLedger, executeLive, planToSetLegs, type LedgerStore } from "./execute";
+import { emptyLedger, newSetId, type SetLedger } from "../src/core/ledger";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -69,6 +76,29 @@ const levelsSource = new HyperliquidLevelSource({
     },
   },
 });
+
+/**
+ * The Set ledger of this server's one account, as a JSON file. Blackboard keeps one per
+ * account in its own database. A missing file is an empty ledger; a corrupt one stops the
+ * request loudly (a silent empty ledger would make every open Set look like a stranger's trade).
+ */
+const ledgerFile = path.join(ROOT, "logs", "set-ledger.json");
+const ledgerStore: LedgerStore = {
+  load: async () => {
+    const text = await readFile(ledgerFile, "utf8").catch((e: NodeJS.ErrnoException) => {
+      if (e.code === "ENOENT") return null;
+      throw e;
+    });
+    if (text === null) return emptyLedger();
+    const l = JSON.parse(text) as SetLedger;
+    if (l?.version !== 1 || !Array.isArray(l.sets)) throw new Error(`${ledgerFile} is not a Set ledger`);
+    return l;
+  },
+  save: async (l) => {
+    await mkdir(path.dirname(ledgerFile), { recursive: true });
+    await writeFile(ledgerFile, JSON.stringify(l, null, 2));
+  },
+};
 
 /** Cryptographic random in [0, 1) for the price nudge. */
 const random = () => randomInt(0, 2 ** 31) / 2 ** 31;
@@ -207,6 +237,10 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/health") {
       return send(res, 200, { mode: cfg.liveTrading ? "live" : "trial", config: describeConfig(cfg) });
     }
+    if (req.method === "GET" && url.pathname === "/api/sets") {
+      const ledger = await ledgerStore.load();
+      return send(res, 200, { count: ledger.sets.length, sets: describeLedger(ledger) });
+    }
     if (req.method === "GET" && url.pathname === "/api/price") {
       const symbol = (url.searchParams.get("symbol") ?? "BTCUSDT").toUpperCase();
       if (!/^[A-Z0-9]{2,20}USDT$/.test(symbol)) return send(res, 400, { error: "symbol must look like BTCUSDT" });
@@ -244,11 +278,16 @@ const server = createServer(async (req, res) => {
       if (!cfg.liveSymbols.includes(plan.input.symbol)) why.push(`${plan.input.symbol} is not BTCUSDT or ETHUSDT`);
       if (why.length > 0) {
         await logPlan("place", plan, { status: "trial: not sent", why });
-        return send(res, 200, { status: "trial: not sent", trial: true, why, plan, sources, asterOrders: planToSetLegs(plan, rules, false) });
+        // The legs a live Set would carry, with a Set id so the client order ids are visible (one-way mode assumed).
+        const trialId = newSetId(Date.now(), random);
+        return send(res, 200, { status: "trial: not sent", trial: true, why, plan, sources, setId: trialId, asterOrders: planToSetLegs(plan, rules, false, trialId) });
       }
-      const result = await executeLive(aster, plan, rules);
-      await logPlan("place", plan, { status: result.ok ? "sent" : "failed", result });
-      return send(res, result.ok ? 200 : 502, { status: result.ok ? "sent" : "failed", trial: false, plan, result });
+      const result = await executeLive(aster, plan, rules, { store: ledgerStore, random });
+      for (const l of result.log) console[l.level === "error" ? "error" : l.level === "warn" ? "warn" : "log"](`[sets] ${l.message}`);
+      const status = result.ok ? "sent" : result.refused ? "refused" : "failed";
+      await logPlan("place", plan, { status, result });
+      // Refused = nothing was sent (balance, a trade outside the Sets on this coin, a mode change).
+      return send(res, result.ok ? 200 : result.refused ? 409 : 502, { status, trial: false, plan, result });
     }
     return send(res, 404, { error: "not found" });
   } catch (e) {

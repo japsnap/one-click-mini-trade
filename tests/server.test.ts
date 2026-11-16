@@ -4,8 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { ConfigError, describeConfig, loadConfig } from "../server/config";
-import { planToSetLegs, reconcileStop } from "../server/execute";
-import { AsterClient, privateKeySigner } from "../src/exchange/aster";
+import { planToSetLegs } from "../server/execute";
 import { buildSetPlan } from "../src/core/plan";
 import type { SymbolRules } from "../src/core/types";
 
@@ -48,7 +47,9 @@ describe("plan -> Aster OTOCO legs (entry, take-profit, stop)", () => {
     levels: { limitLevels: [{ price: 63900, weightUsd: 1e6, side: "buy" }], takeProfitLevels: [], liquidationLevels: [] },
     random: () => 0.5,
   });
-  it("one-way mode: LIMIT GTC entry; reduce-only TP and STOP_MARKET on mark price, both driven by the entry, each cancelling the other", () => {
+  // Changed 2026-11-16 (many Sets at once): one-way exits are plain opposite-side orders, no
+  // longer reduce-only, so a Buy Set and a Sell Set on one coin cannot block each other's exits.
+  it("one-way mode: LIMIT GTC entry; plain (not reduce-only) TP and STOP_MARKET on mark price, both driven by the entry, each cancelling the other", () => {
     const [l] = planToSetLegs(plan, BTC, false);
     // Nearby with r = 0.5: middle of bucket 3 (0.15%-0.2%) = 63,888, nudge 0 -> 63,888.0
     expect(l!.entry).toMatchObject({ strategySubId: "1", type: "LIMIT", side: "BUY", timeInForce: "GTC", price: "63888.0", quantity: "0.023" });
@@ -56,7 +57,6 @@ describe("plan -> Aster OTOCO legs (entry, take-profit, stop)", () => {
       strategySubId: "2",
       type: "TAKE_PROFIT_MARKET",
       side: "SELL",
-      reduceOnly: "true",
       workingType: "MARK_PRICE",
       firstDrivenId: "1",
       firstDrivenOn: "PARTIALLY_FILLED_OR_FILLED",
@@ -70,7 +70,6 @@ describe("plan -> Aster OTOCO legs (entry, take-profit, stop)", () => {
       strategySubId: "3",
       type: "STOP_MARKET",
       side: "SELL",
-      reduceOnly: "true",
       workingType: "MARK_PRICE",
       firstDrivenId: "1",
       secondDrivenId: "2",
@@ -80,6 +79,9 @@ describe("plan -> Aster OTOCO legs (entry, take-profit, stop)", () => {
     });
     expect(Number(l!.stop.stopPrice)).toBeLessThan(63888);
     expect(Number(l!.stop.stopPrice)).toBeGreaterThan(plan.liquidationPrice);
+    expect(l!.takeProfit.reduceOnly).toBeUndefined(); // one-way: not reduce-only (see above)
+    expect(l!.stop.reduceOnly).toBeUndefined();
+    expect(l!.takeProfit.positionSide).toBeUndefined(); // one-way: BOTH by default
     expect(l!.takeProfit.price).toBeUndefined(); // TAKE_PROFIT_MARKET must not carry price
     expect(l!.stop.price).toBeUndefined(); // nor STOP_MARKET
   });
@@ -99,57 +101,5 @@ describe("plan -> Aster OTOCO legs (entry, take-profit, stop)", () => {
     expect(() => planToSetLegs(beyond, BTC, false)).toThrow(/beyond the liquidation/);
     const wrongSide = { ...plan, orders: { ...plan.orders, stops: [{ stopPrice: 64500, qty: 0.023 }] } };
     expect(() => planToSetLegs(wrongSide, BTC, false)).toThrow(/opposite sides/);
-  });
-});
-
-describe("reconcileStop after a fill (HYBRID: fake fetch records requests; no network)", () => {
-  // Public demo key from the Aster V3 doc.
-  const key = "0x4fd0a42218f3eae43a6ce26d22544e986139a01e5b34a62db53757ffca81bae1" as const;
-  const s = privateKeySigner(key);
-  const plan = buildSetPlan({
-    input: { symbol: "BTCUSDT", side: "buy", ticketUsd: 10, leverage: 30, tpMode: "deserved", entryMode: "now" },
-    currentPrice: 64000,
-    rules: BTC,
-    levels: { limitLevels: [], takeProfitLevels: [], liquidationLevels: [] },
-    random: () => 0.5,
-  });
-  function client(positionRisk: unknown) {
-    const calls: Array<{ url: string; body: string }> = [];
-    const c = new AsterClient({
-      fetch: async (url, init) => {
-        calls.push({ url, body: String(init?.body ?? "") });
-        if (url.includes("/fapi/v3/positionRisk")) return new Response(JSON.stringify(positionRisk));
-        return new Response(JSON.stringify({ orderId: 1 }));
-      },
-      auth: { user: ("0x" + "a".repeat(40)) as `0x${string}`, signer: s.address, sign: s.sign },
-      builder: { address: ("0x" + "b".repeat(40)) as `0x${string}`, feeRate: "0.0001" },
-    });
-    return { c, calls };
-  }
-  const row = (liq: string) => [{ symbol: "BTCUSDT", positionSide: "BOTH", positionAmt: "0.004", entryPrice: "64000", liquidationPrice: liq, markPrice: "64000" }];
-
-  it("moves the stop to 85% of the venue's real liquidation distance, reduce-only, with builder fields", async () => {
-    const { c, calls } = client(row("62100")); // venue says 1,900 away
-    const r = await reconcileStop(c, plan, BTC, { currentStopPrice: plan.stop.price, currentStopOrderId: "77", hedgeMode: false, apply: true });
-    expect(r.changed).toBe(true);
-    expect(r.target).toBe(62385); // 64,000 - 0.85 x 1,900
-    const placed = calls.find((x) => x.url.endsWith("/fapi/v3/order") && x.body.includes("STOP_MARKET"))!;
-    expect(placed.body).toContain("type=STOP_MARKET");
-    expect(placed.body).toContain("stopPrice=62385.0");
-    expect(placed.body).toContain("reduceOnly=true");
-    expect(placed.body).toContain("builder=0x" + "b".repeat(40));
-    expect(placed.body).toContain("feeRate=0.0001");
-    expect(calls.some((x) => x.body.includes("orderId=77"))).toBe(true); // the old stop is cancelled
-  });
-  it("keeps the stop and says why when the venue reports no liquidation price, or the planned one is within a tick (negative)", async () => {
-    const none = await reconcileStop(client(row("0")).c, plan, BTC, { currentStopPrice: plan.stop.price, hedgeMode: false, apply: true });
-    expect(none.changed).toBe(false);
-    expect(none.reason).toMatch(/no liquidation price/);
-    const same = client(row(String(plan.liquidationPrice)));
-    const r = await reconcileStop(same.c, plan, BTC, { currentStopPrice: plan.stop.price, hedgeMode: false, apply: true });
-    expect(r.changed).toBe(false);
-    expect(same.calls.filter((x) => x.url.endsWith("/fapi/v3/order"))).toHaveLength(0);
-    const flat = await reconcileStop(client([{ symbol: "BTCUSDT", positionAmt: "0" }]).c, plan, BTC, { currentStopPrice: 1, hedgeMode: false, apply: true });
-    expect(flat.reason).toMatch(/no open position/);
   });
 });

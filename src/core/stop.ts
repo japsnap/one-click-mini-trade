@@ -24,8 +24,9 @@
  *    liquidation, where the stop would never fire. Example, 100x with a real rate of
  *    0.4%: plain distance 1%, real distance 0.6%, 85% of the plain one = 0.85%.
  *  - AFTER the fill: the exchange's own figure, Aster GET /fapi/v3/positionRisk
- *    "liquidationPrice" (signed). The stop is then re-computed from it (see
- *    stopFromPositionRisk in src/exchange/aster.ts and reconcileStop in server/execute.ts).
+ *    "liquidationPrice" (signed). Since 2026-11-16 that figure belongs to the merged
+ *    position of every Set on the coin, so it is the CAP of each Set's own stop
+ *    (setStopPrice below; applied by syncSetExits in server/execute.ts).
  *
  * The take-profit ratio is measured against the STOP distance, because that is the
  * real loss (see takeProfit.ts).
@@ -161,5 +162,117 @@ export function planStop(args: {
     maintenanceMarginRate: args.maintenanceMarginRate,
     maintenanceSource: args.maintenanceSource,
     fractionOfLiquidation: fraction,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Per-Set stop when many Sets are open at once (rules of 2026-11-16, "Many Sets at once")
+// ---------------------------------------------------------------------------
+//
+// Why a second rule: Aster keeps ONE position per symbol (one-way mode) or one per symbol
+// and side (hedge mode). Several Sets on BTC merge into that position, so the venue's
+// liquidation price belongs to the whole position, never to one Set. Each Set therefore
+// gets its stop from its OWN numbers, then a cap from the real position:
+//
+//   1. Ticket rule: the price where THIS Set has lost 85% of its ticket.
+//        Buy:  stop = entry - 0.85 x ticket / qty
+//        Sell: stop = entry + 0.85 x ticket / qty
+//      (qty x leverage sizing: qty is about ticket x leverage / entry, so this is about
+//      85% of 1/leverage away from the entry.)
+//   2. Cap: never beyond 85% of the real liquidation distance of the account's position
+//      on that symbol (positionRisk entryPrice -> liquidationPrice). Before the position
+//      exists (or when the position on that side belongs to the other direction in
+//      one-way mode) the cap is the pre-fill ESTIMATE (estimateLiquidationPrice above),
+//      computed at the SYMBOL's leverage, which is at least the Set's (a 30x Set placed
+//      while the symbol stands at 50x gets only 1/50 of its notional as margin).
+//   3. The stop is whichever of the two fires FIRST (nearer the entry for a normal Set:
+//      the higher price for a Buy, the lower for a Sell).
+//
+// Before the fill rule 2 always wins (85% of a distance shortened by maintenance margin is
+// nearer than 85% of 1/leverage), so plans made before this change keep the same stop.
+// After the fill, rule 1 can win: for example on cross margin with a large balance the
+// venue's liquidation sits far away, and the Set must still stop at 85% of its own ticket.
+
+/** Share of the ticket a Set may lose before its stop fires. 0.85 = 85%. */
+export const STOP_FRACTION_OF_TICKET = 0.85;
+
+/**
+ * The price at which a Set of `qty` entered at `entry` has lost `fraction` of `ticketUsd`.
+ * Rounded to the tick TOWARD the entry (up for a Buy, down for a Sell), so rounding never
+ * lets the loss exceed the fraction.
+ * Units: entry quote per base; qty base; ticketUsd USD; result quote per base.
+ */
+export function stopFromTicketLoss(args: {
+  entry: number;
+  qty: number;
+  ticketUsd: number;
+  side: Side;
+  tickSize: number;
+  fraction?: number;
+}): number {
+  const fraction = args.fraction ?? STOP_FRACTION_OF_TICKET;
+  if (!(args.entry > 0) || !(args.qty > 0) || !(args.ticketUsd > 0)) throw new InvalidStopError("entry, qty and ticket must be positive");
+  if (!(fraction > 0 && fraction < 1)) throw new InvalidStopError(`ticket fraction must be between 0 and 1, got ${fraction}`);
+  const dist = (fraction * args.ticketUsd) / args.qty; // price move that costs fraction x ticket
+  const raw = args.side === "buy" ? args.entry - dist : args.entry + dist;
+  if (!(raw > args.tickSize)) throw new InvalidStopError(`ticket stop ${raw} is not a usable price`);
+  return roundToTick(raw, args.tickSize, args.side === "buy" ? "up" : "down");
+}
+
+/**
+ * Where the cap comes from.
+ *  - "position": the account's real position on the symbol (signed GET /fapi/v3/positionRisk).
+ *  - "estimate": no usable position yet; the pre-fill estimate at `leverage` (the symbol's
+ *    leverage, at least the Set's) and the maintenance rate in use.
+ */
+export type StopCap =
+  | { source: "position"; entryPrice: number; liquidationPrice: number }
+  | { source: "estimate"; leverage: number; maintenanceMarginRate: number };
+
+/** Which rule set the final stop. */
+export type StopBound = "ticket" | "liquidation";
+
+/** The result of setStopPrice. Units: quote per base. */
+export interface SetStop {
+  /** The stop to place. */
+  stopPrice: number;
+  /** Rule 1: 85% of the ticket. */
+  ticketStopPrice: number;
+  /** Rule 2: 85% of the (real or estimated) liquidation distance. */
+  capStopPrice: number;
+  boundBy: StopBound;
+  capSource: StopCap["source"];
+}
+
+/**
+ * One Set's stop: the ticket rule, capped by the liquidation rule, whichever fires first.
+ * `qty` and `ticketUsd` describe the same slice of the Set (the whole planned leg, or the
+ * filled part with its share of the ticket: the distance is the same either way).
+ * Units: prices quote per base; qty base; ticket USD.
+ */
+export function setStopPrice(args: {
+  side: Side;
+  entry: number;
+  qty: number;
+  ticketUsd: number;
+  tickSize: number;
+  cap: StopCap;
+  ticketFraction?: number;
+  liquidationFraction?: number;
+}): SetStop {
+  const { side, entry, tickSize, cap } = args;
+  const ticketStopPrice = stopFromTicketLoss({ entry, qty: args.qty, ticketUsd: args.ticketUsd, side, tickSize, fraction: args.ticketFraction });
+  const capStopPrice =
+    cap.source === "position"
+      ? stopPriceFromLiquidation(cap.entryPrice, cap.liquidationPrice, side, tickSize, args.liquidationFraction)
+      : stopPriceFromLiquidation(entry, estimateLiquidationPrice(entry, cap.leverage, side, cap.maintenanceMarginRate), side, tickSize, args.liquidationFraction);
+  // Fires first = the higher price for a Buy (price falls into it sooner), the lower for a Sell.
+  const ticketFirst = side === "buy" ? ticketStopPrice >= capStopPrice : ticketStopPrice <= capStopPrice;
+  return {
+    stopPrice: ticketFirst ? ticketStopPrice : capStopPrice,
+    ticketStopPrice,
+    capStopPrice,
+    boundBy: ticketFirst ? "ticket" : "liquidation",
+    capSource: cap.source,
   };
 }

@@ -23,9 +23,11 @@
  * Why per leg: a leg may fill alone, and a stop computed from the average of all legs
  * can sit beyond the liquidation of the leg that filled first. Known limit: when
  * several legs fill, the combined position's liquidation is at their average entry,
- * which can be nearer than the lowest leg's stop (Buy) on a wide In band; the stop
- * re-check after each fill (server/execute.ts reconcileStop, using Aster's real
- * positionRisk liquidationPrice) is what closes that gap.
+ * which can be nearer than the lowest leg's stop (Buy) on a wide In band; the exit
+ * re-sync after each fill (server/execute.ts syncSetExits: each leg's stop from its own
+ * fill, capped at 85% of Aster's real positionRisk liquidation distance) closes that gap.
+ * liquidationLeverage (2026-11-16, many Sets at once): the leverage the liquidation
+ * estimate uses, when the symbol already stands above the Set's own leverage.
  */
 import { estimateLiquidationPrice } from "./liquidation";
 import { nudgePrice, DEFAULT_NUDGE_FRACTION } from "./nudge";
@@ -138,6 +140,8 @@ export function splitDraw(args: {
   /** Maintenance margin rate for the liquidation estimates. Default: the assumed 0.5% (stop.ts). */
   maintenanceMarginRate?: number;
   maintenanceSource?: MaintenanceSource;
+  /** Leverage for the liquidation estimates (the symbol's, when higher than the Set's). Default: leverage. */
+  liquidationLeverage?: number;
 }): DrawPlan {
   const mmr = args.maintenanceMarginRate ?? DEFAULT_ASSUMED_MAINTENANCE_RATE;
   const mmrSource: MaintenanceSource = args.maintenanceSource ?? "assumed";
@@ -173,10 +177,11 @@ export function splitDraw(args: {
     const totalQty = entries.reduce((s, l) => s + l.qty, 0);
     const totalNotionalUsd = entries.reduce((s, l) => s + l.qty * l.price, 0);
     const averageEntry = totalNotionalUsd / totalQty; // quantity-weighted average price
-    const liq = estimateLiquidationPrice(averageEntry, args.leverage, side, mmr);
+    const liqLev = Math.max(args.leverage, args.liquidationLeverage ?? 0); // sizing uses the Set's leverage, the estimate the symbol's
+    const liq = estimateLiquidationPrice(averageEntry, liqLev, side, mmr);
     // One stop per leg, from that leg's own entry (see the header for why).
     const legStops = entries.map((e) =>
-      planStop({ entry: e.price, side, leverage: args.leverage, tickSize: rules.tickSize, maintenanceMarginRate: mmr, maintenanceSource: mmrSource }),
+      planStop({ entry: e.price, side, leverage: liqLev, tickSize: rules.tickSize, maintenanceMarginRate: mmr, maintenanceSource: mmrSource }),
     );
     const stops: DrawLeg[] = legStops.map((st, i) => ({ price: st.stopPrice, qty: entries[i]?.qty ?? 0 }));
     // Every leg must still pay at least 1x its own risk (reward / stop distance).

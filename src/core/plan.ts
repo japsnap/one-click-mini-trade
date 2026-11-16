@@ -11,8 +11,10 @@
  *
  * Every Set is three orders per entry (since 2026-11-16):
  *   entry  (market or limit)
- *   take-profit  (reduce-only TAKE_PROFIT_MARKET; takeProfit.ts)
- *   stop         (reduce-only STOP_MARKET at 85% of the liquidation distance; stop.ts)
+ *   take-profit  (TAKE_PROFIT_MARKET; takeProfit.ts)
+ *   stop         (STOP_MARKET at 85% of the liquidation distance; stop.ts)
+ * The exits close the Set's own quantity. Since 2026-11-16 they are not reduce-only in
+ * one-way mode, so many Sets on one coin cannot block each other (src/core/ledger.ts).
  *
  * Order of random draws (for a seeded source): Nearby bucket, price inside the bucket,
  * nudge, then the take-profit's jitter in front of a volume wall. Now draws only the
@@ -22,7 +24,7 @@
 import { pickEntry, type EntryDecision, type EntryDiagnostics, type EntryOptions } from "./entry";
 import { splitDraw } from "./drawSplit";
 import { splitFees, type FeeSplit } from "./fees";
-import { liquidationDistance } from "./liquidation";
+import { estimateLiquidationPrice, liquidationDistance } from "./liquidation";
 import { nudgePrice } from "./nudge";
 import { floorToStep, roundToTick } from "./rounding";
 import { planStop, resolveMaintenanceRate, type MaintenanceSource } from "./stop";
@@ -286,6 +288,63 @@ export function buildSetPlan(args: {
       entry: decision.diagnostics,
       takeProfitZone: tp.diagnostics,
       oppositeVolumeLevels: { venueBook: venueBook.length, traders: traderOrders.length },
+    },
+  };
+}
+
+/**
+ * The same plan, with every stop pulled in for a symbol that stands at a HIGHER leverage
+ * than the Set's own (many Sets at once, 2026-11-16).
+ * Why: Aster's leverage is one number per symbol. When a 50x Set is open on BTC, a new 30x
+ * Set is still sized at 30x (notional = ticket x 30) but the venue takes only 1/50 of that
+ * notional as margin, so its position liquidates about where a 50x one would. Its stop
+ * must sit in front of THAT liquidation. Each leg's stop becomes the nearer of its planned
+ * stop and 85% of the liquidation estimated at `symbolLeverage`; quantities, entries and
+ * take-profits stay. A symbolLeverage at or below the Set's returns the plan unchanged.
+ * Units: symbolLeverage a multiplier.
+ */
+export function withSymbolLeverage(plan: SetPlan, rules: SymbolRules, symbolLeverage: number): SetPlan {
+  if (!(symbolLeverage > plan.input.leverage)) return plan;
+  const side = plan.input.side;
+  const sign = side === "buy" ? 1 : -1;
+  const stops: PlannedTrigger[] = [];
+  let liq = plan.liquidationPrice;
+  let minRatio = Infinity;
+  let loss = 0;
+  plan.orders.entries.forEach((e, i) => {
+    const entry = e.price ?? plan.entry.expectedFillPrice;
+    const old = plan.orders.stops[i] as PlannedTrigger;
+    const tighter = planStop({
+      entry,
+      side,
+      leverage: symbolLeverage,
+      tickSize: rules.tickSize,
+      maintenanceMarginRate: plan.stop.maintenanceMarginRate,
+      maintenanceSource: plan.stop.maintenanceSource,
+      fraction: plan.stop.fractionOfLiquidation,
+    });
+    // Nearer the entry = fires first: the higher price for a Buy, the lower for a Sell.
+    const stopPrice = sign * tighter.stopPrice > sign * old.stopPrice ? tighter.stopPrice : old.stopPrice;
+    stops.push({ stopPrice, qty: old.qty });
+    if (plan.orders.entries.length === 1) liq = tighter.liquidationPrice;
+    const tp = plan.orders.takeProfits[i] as PlannedTrigger;
+    minRatio = Math.min(minRatio, Math.abs(tp.stopPrice - entry) / Math.abs(entry - stopPrice));
+    loss += old.qty * Math.abs(entry - stopPrice);
+  });
+  if (plan.orders.entries.length > 1) {
+    liq = estimateLiquidationPrice(plan.entry.expectedFillPrice, symbolLeverage, side, plan.stop.maintenanceMarginRate);
+  }
+  const totalQty = stops.reduce((s, t) => s + t.qty, 0);
+  return {
+    ...plan,
+    orders: { ...plan.orders, stops },
+    liquidationPrice: liq,
+    stop: { ...plan.stop, price: stops.reduce((s, t) => s + t.stopPrice * t.qty, 0) / totalQty },
+    takeProfit: { ...plan.takeProfit, ratio: Math.round(minRatio * 1e6) / 1e6 },
+    expected: {
+      ...plan.expected,
+      lossAtStopUsd: -round2(loss),
+      lossAtLiquidationUsd: -round2(totalQty * liquidationDistance(plan.entry.expectedFillPrice, liq)),
     },
   };
 }

@@ -31,6 +31,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { recoverTypedDataAddress, zeroAddress, type Hex } from "viem";
 import { stopPriceFromLiquidation, STOP_FRACTION_OF_LIQUIDATION } from "../core/stop";
 import type { Level, LeverageBracket, OrderBookDepth, Side, SymbolRules } from "../core/types";
+import type { OrderUpdate } from "../core/ledger";
 
 /** Mainnet host from the V3 doc. Testnet: https://fapi.asterdex-testnet.com */
 export const ASTER_MAINNET_URL = "https://fapi.asterdex.com";
@@ -187,6 +188,30 @@ export interface StrategySubOrder {
   secondDrivenId?: string;
   secondDrivenOn?: "PARTIALLY_FILLED_OR_FILLED" | "FILLED";
   secondTrigger?: "PLACE_ORDER" | "CANCEL_ORDER";
+  /**
+   * Our own id for this leg's order (V3 doc sub-order field "clientOrderId"). Sets use
+   * `<setId>-<leg><E|T|S>` (src/core/ledger.ts) so fills can be matched to the Set.
+   * Whether Aster echoes it in ORDER_TRADE_UPDATE "c" is not shown in the doc; the ledger
+   * also matches by orderId (see linkSetOrders in server/execute.ts).
+   */
+  clientOrderId?: string;
+}
+
+/**
+ * One sub-order change for POST /fapi/v3/updateStrategyOrder (V3 doc "Update Strategy
+ * Order"): strategySubId, securityType, symbol, side, type are required; quantity and
+ * stopPrice are what Sets change (exits resized to the filled quantity, stop re-capped).
+ */
+export interface StrategySubOrderUpdate {
+  strategySubId: string;
+  securityType: "USDT_FUTURES";
+  symbol: string;
+  side: "BUY" | "SELL";
+  positionSide?: "BOTH" | "LONG" | "SHORT";
+  type: "TAKE_PROFIT_MARKET" | "STOP_MARKET";
+  quantity?: string;
+  stopPrice?: string;
+  workingType?: "MARK_PRICE" | "CONTRACT_PRICE";
 }
 
 /** Options for AsterClient. */
@@ -326,6 +351,96 @@ export function parsePositionRisk(json: unknown, symbol: string, hedgePositionSi
     };
   }
   return null;
+}
+
+/**
+ * Every position row of one symbol from signed GET /fapi/v3/positionRisk, flat rows
+ * included (the doc returns a row per symbol in one-way mode, LONG and SHORT rows in
+ * hedge mode). Also gives the symbol's current leverage ("leverage", same on every row).
+ * Used by the Set ledger: reconcile compares these amounts with the open Sets, and the
+ * per-Set stop is capped by the liquidation price of the row on the Set's side.
+ * Units: prices quote per base; positionAmt base (negative = short); leverage multiplier.
+ */
+export interface PositionRow {
+  positionSide: "BOTH" | "LONG" | "SHORT";
+  positionAmt: number;
+  entryPrice: number;
+  liquidationPrice: number;
+  markPrice: number;
+  /** null when the row does not carry it. */
+  leverage: number | null;
+}
+export function parsePositionRows(json: unknown, symbol: string): PositionRow[] {
+  const rows = Array.isArray(json) ? json : json && typeof json === "object" ? [json] : [];
+  const out: PositionRow[] = [];
+  for (const r of rows as Array<Record<string, unknown>>) {
+    if (r?.symbol !== symbol) continue;
+    const side = r.positionSide === "LONG" || r.positionSide === "SHORT" ? r.positionSide : "BOTH";
+    const amt = num(r.positionAmt);
+    if (!Number.isFinite(amt)) throw new Error(`positionRisk ${symbol}: positionAmt missing or not a number`);
+    const lev = num(r.leverage);
+    out.push({
+      positionSide: side,
+      positionAmt: amt,
+      entryPrice: num(r.entryPrice) || 0,
+      liquidationPrice: num(r.liquidationPrice) || 0,
+      markPrice: num(r.markPrice) || 0,
+      leverage: Number.isFinite(lev) && lev >= 1 ? lev : null,
+    });
+  }
+  return out;
+}
+/** The symbol's leverage from its position rows (first row that carries one), or null. */
+export function symbolLeverageFromRows(rows: PositionRow[]): number | null {
+  return rows.find((r) => r.leverage !== null)?.leverage ?? null;
+}
+
+/**
+ * USDT balances from signed GET /fapi/v3/balance (V3 doc "Futures Account Balance v3").
+ * Throws when there is no USDT row: refusing a Set is better than sizing on a guess.
+ * Units: USD (USDT).
+ */
+export function parseUsdtBalance(json: unknown): { walletBalanceUsd: number; availableBalanceUsd: number } {
+  const rows = Array.isArray(json) ? json : [];
+  const usdt = (rows as Array<Record<string, unknown>>).find((r) => r?.asset === "USDT");
+  if (!usdt) throw new Error("balance: no USDT row");
+  const wallet = num(usdt.balance);
+  const available = num(usdt.availableBalance);
+  if (!Number.isFinite(wallet) || !Number.isFinite(available)) throw new Error("balance: USDT balance or availableBalance is not a number");
+  return { walletBalanceUsd: wallet, availableBalanceUsd: available };
+}
+
+/**
+ * Turn one user-data-stream message into the ledger's OrderUpdate, or null when it is
+ * not an ORDER_TRADE_UPDATE. Field letters from the V3 doc "Event: Order Update":
+ *   o.s symbol, o.c client order id, o.i order id, o.X status, o.x execution type,
+ *   o.l last filled qty, o.L last filled price, o.n commission, o.N commission asset,
+ *   o.t trade id, o.T trade time.
+ * Every field is coerced; a message without a symbol or a status is refused loudly.
+ */
+export function parseOrderTradeUpdate(json: unknown): OrderUpdate | null {
+  const m = json !== null && typeof json === "object" ? (json as Record<string, unknown>) : null;
+  if (!m || m.e !== "ORDER_TRADE_UPDATE") return null;
+  const o = (m.o ?? {}) as Record<string, unknown>;
+  if (typeof o.s !== "string" || typeof o.X !== "string") throw new Error("ORDER_TRADE_UPDATE without symbol or status");
+  const t = num(o.t);
+  const time = num(o.T);
+  const l = num(o.l);
+  const L = num(o.L);
+  const n = num(o.n);
+  return {
+    symbol: o.s,
+    clientOrderId: typeof o.c === "string" ? o.c : "",
+    orderId: o.i === undefined || o.i === null ? null : String(o.i),
+    status: o.X,
+    executionType: typeof o.x === "string" ? o.x : "",
+    lastFilledQty: Number.isFinite(l) ? l : 0,
+    lastFilledPrice: Number.isFinite(L) ? L : 0,
+    commission: Number.isFinite(n) ? n : 0,
+    commissionAsset: typeof o.N === "string" ? o.N : null,
+    tradeId: Number.isFinite(t) && t > 0 ? String(t) : null,
+    time: Number.isFinite(time) ? time : num(m.E) || 0,
+  };
 }
 
 /**
@@ -469,8 +584,9 @@ export class AsterClient {
   }
 
   /**
-   * POST /fapi/v3/marginType. A Set needs ISOLATED: only then is the ticket the most you can lose.
-   * Aster answers -4046 when the type is already set; that counts as success.
+   * POST /fapi/v3/marginType. Aster answers -4046 when the type is already set; that counts as success.
+   * NOT CALLED BY SETS since 2026-11-16: the account's margin type (and position mode) belong
+   * to the user's own Blackboard app and are never changed by a Set. Kept for tools only.
    */
   async ensureIsolated(symbol: string): Promise<void> {
     try {
@@ -531,6 +647,45 @@ export class AsterClient {
   /** DELETE /fapi/v3/order by orderId. */
   cancelOrder(symbol: string, orderId: string) {
     return this.signed("DELETE", "/fapi/v3/order", [["symbol", symbol], ["orderId", orderId]]);
+  }
+
+  /** DELETE /fapi/v3/order by our own client order id (origClientOrderId). */
+  cancelOrderByClientId(symbol: string, clientOrderId: string) {
+    return this.signed("DELETE", "/fapi/v3/order", [["symbol", symbol], ["origClientOrderId", clientOrderId]]);
+  }
+
+  /**
+   * POST /fapi/v3/updateStrategyOrder: change sub-orders of a working strategy (Sets use it
+   * to size exits to the filled quantity and to move the stop, keeping the OTOCO link so
+   * the exchange still cancels one exit when the other fills). The doc lists no builder
+   * fields here, and unlisted parameters are rejected, so none are added. The answer is an
+   * array with one result per sub-order; any failureCode or updateStatus other than
+   * SUCCESS is thrown.
+   */
+  async updateStrategyOrder(strategyId: string, strategyType: "OTO" | "OCO" | "OTOCO", subs: StrategySubOrderUpdate[]) {
+    const j = await this.signed("POST", "/fapi/v3/updateStrategyOrder", [
+      ["strategyId", strategyId],
+      ["strategyType", strategyType],
+      ["subOrderList", JSON.stringify(subs)],
+    ]);
+    for (const r of (Array.isArray(j) ? j : [j]) as Array<Record<string, unknown>>) {
+      const fc = num(r?.failureCode);
+      const status = r?.updateStatus;
+      if ((Number.isFinite(fc) && fc !== 0) || (typeof status === "string" && status !== "SUCCESS")) {
+        throw new AsterApiError(200, Number.isFinite(fc) ? fc : null, String(r?.failureReason || status || "update rejected"), "/fapi/v3/updateStrategyOrder");
+      }
+    }
+    return j;
+  }
+
+  /** GET /fapi/v3/strategyOpenOrder by our clientStrategyId: the sub-orders with Aster's orderIds. */
+  strategyOpenOrder(clientStrategyId: string, strategyType: "OTO" | "OCO" | "OTOCO") {
+    return this.signed("GET", "/fapi/v3/strategyOpenOrder", [["clientStrategyId", clientStrategyId], ["strategyType", strategyType]]);
+  }
+
+  /** GET /fapi/v3/balance (Futures Account Balance v3). Parse with parseUsdtBalance. */
+  balance() {
+    return this.signed("GET", "/fapi/v3/balance", []);
   }
 
   /** GET /fapi/v3/openOrders for one symbol. */
