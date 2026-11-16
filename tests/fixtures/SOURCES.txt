@@ -1,0 +1,5 @@
+Fixtures captured from real public responses on 2026-11-16, trimmed, shape unchanged.
+hl-leaderboard.json          GET https://stats-data.hyperliquid.xyz/Mainnet/leaderboard (first 3 of 47,721 rows)
+hl-clearinghouseState.json   POST https://api.hyperliquid.xyz/info {"type":"clearinghouseState","user":"0x5b5d51203a0f9079f8aeb098a6523a13f298c060"} (assetPositions trimmed to BTC and ETH)
+hl-frontendOpenOrders.json   POST https://api.hyperliquid.xyz/info {"type":"frontendOpenOrders","user":"0xfc27136e42af1732ddc9ce2605ea9bff1b959d9d"} (4 BTC orders and 1 ZEC order)
+aster-exchangeInfo.json      GET https://fapi.asterdex.com/fapi/v3/exchangeInfo (symbols trimmed to BTCUSDT and ETHUSDT)

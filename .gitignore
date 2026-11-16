@@ -1,0 +1,10 @@
+# Secrets: every .env file stays out of git, except the empty template.
+.env*
+!.env.example
+*.key
+*.pem
+node_modules/
+dist/
+# Local caches and order-plan logs written by the demo server.
+.cache/
+logs/

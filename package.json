@@ -1,0 +1,35 @@
+{
+  "name": "one-click-mini-trade",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A Set: one-button leveraged trade on Aster, entry and take-profit picked from skilled traders' levels on Hyperliquid.",
+  "type": "module",
+  "engines": { "node": ">=20.12" },
+  "scripts": {
+    "dev": "vite",
+    "server": "tsx server/index.ts",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "5.107.1",
+    "lucide-react": "1.73.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "styled-components": "6.6.0",
+    "viem": "2.57.20"
+  },
+  "devDependencies": {
+    "@testing-library/react": "16.3.3",
+    "@types/node": "26.6.6",
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
+    "@vitejs/plugin-react": "6.3.0",
+    "jsdom": "31.0.1",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vite": "8.3.8",
+    "vitest": "5.1.0"
+  }
+}
