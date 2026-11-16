@@ -9,13 +9,18 @@
  * a good guide for an order on Aster.
  *
  * Flow:
- *  1. Leaderboard (stats-data.hyperliquid.xyz, about 39 MB): keep only the top N
- *     traders by 30-day ("month") profit with at least a minimum account value.
+ *  1. Leaderboard (stats-data.hyperliquid.xyz, about 39 MB, 47,728 rows on 2026-11-16):
+ *     keep profitable traders and split them into two sets (selectTraders):
+ *       orders set:    top 30 by 30-day profit (accounts >= $100k)
+ *       positions set: top 50 by 30-day profit + top 150 by 30-day volume (>= $10k)
  *     Cached in memory and optionally on disk, because it is big and changes slowly.
- *  2. For each kept trader, POST api.hyperliquid.xyz/info:
+ *  2. POST api.hyperliquid.xyz/info:
  *       {"type":"clearinghouseState","user":addr}  -> open positions (entryPx, liquidationPx, szi, positionValue)
+ *                                                     for the positions set (weight 2 each)
  *       {"type":"frontendOpenOrders","user":addr}  -> resting limits and take-profit orders
- *     with a concurrency limit, a timeout per request, and a short per-coin cache.
+ *                                                     for the orders set (weight 20 each)
+ *     with a concurrency limit, a timeout per request, a per-address and per-coin cache
+ *     (60 s), and a per-minute weight budget under Hyperliquid's 1,200 per IP.
  *  3. Return { limitLevels, takeProfitLevels, liquidationLevels } for one coin.
  *
  * Every field is coerced at this boundary: Hyperliquid sends numbers as strings,
@@ -53,16 +58,20 @@ export interface LeaderboardTrader {
   accountValueUsd: number;
   monthPnlUsd: number;
   monthRoi: number;
+  /** 30-day traded volume. Missing in caches written before 2026-11-16 (then NaN). */
+  monthVolumeUsd: number;
 }
 
 /**
- * Pick the top traders from the leaderboard JSON.
- * Why: "skilled" = most 30-day profit among accounts large enough to matter.
+ * Read the leaderboard JSON into traders.
+ * Keeps only accounts with a positive 30-day profit ("skilled": losing traders are not
+ * copied) and at least minAccountValueUsd. Sorted by 30-day profit, or by 30-day volume
+ * with rankBy "monthVolume". topN cuts the list (default 30; Infinity keeps all).
  * Units: minAccountValueUsd in USD.
  */
 export function parseLeaderboard(
   json: unknown,
-  opts: { topN?: number; minAccountValueUsd?: number } = {},
+  opts: { topN?: number; minAccountValueUsd?: number; rankBy?: "monthPnl" | "monthVolume" } = {},
 ): LeaderboardTrader[] {
   const topN = opts.topN ?? 30;
   const minValue = opts.minAccountValueUsd ?? 100_000;
@@ -77,19 +86,73 @@ export function parseLeaderboard(
     // windowPerformances is a list of [name, {pnl, roi, vlm}] pairs; find "month".
     let monthPnlUsd = Number.NaN;
     let monthRoi = Number.NaN;
+    let monthVolumeUsd = Number.NaN;
     for (const w of toArr(row.windowPerformances)) {
       const pair = toArr(w);
       if (pair[0] === "month") {
         const perf = toObj(pair[1]);
         monthPnlUsd = toNum(perf.pnl);
         monthRoi = toNum(perf.roi);
+        monthVolumeUsd = toNum(perf.vlm);
       }
     }
     if (!Number.isFinite(monthPnlUsd) || monthPnlUsd <= 0) continue; // losing traders are not copied
-    out.push({ address, accountValueUsd, monthPnlUsd, monthRoi });
+    out.push({ address, accountValueUsd, monthPnlUsd, monthRoi, monthVolumeUsd });
   }
-  out.sort((a, b) => b.monthPnlUsd - a.monthPnlUsd);
+  if (opts.rankBy === "monthVolume") out.sort((a, b) => (b.monthVolumeUsd || 0) - (a.monthVolumeUsd || 0));
+  else out.sort((a, b) => b.monthPnlUsd - a.monthPnlUsd);
   return out.slice(0, topN);
+}
+
+/** How many traders feed each kind of level. See HyperliquidSourceOptions for the why. */
+export interface TraderSelectionOptions {
+  /** Resting orders (Nearby, take-profit zone) from the top N by 30-day profit. Default 30. */
+  ordersTopN: number;
+  /** Positions (Patient) from the top N by 30-day profit... Default 50. */
+  positionsByPnlTopN: number;
+  /** ...plus the top N by 30-day volume (profitable only). Default 150. */
+  positionsByVolumeTopN: number;
+  /** Account floor for the profit ranks. Default $100,000. */
+  minAccountValueUsd: number;
+  /** Account floor for the volume rank. Default $10,000. */
+  minAccountValueForVolumeUsd: number;
+}
+
+export const DEFAULT_TRADER_SELECTION: TraderSelectionOptions = {
+  ordersTopN: 30,
+  positionsByPnlTopN: 50,
+  positionsByVolumeTopN: 150,
+  minAccountValueUsd: 100_000,
+  minAccountValueForVolumeUsd: 10_000,
+};
+
+/**
+ * Split traders into the two sets the source queries.
+ *  - orders:    top ordersTopN by 30-day profit (accounts >= $100k): the "skilled" set whose
+ *               resting limits Nearby and the take-profit zone follow.
+ *  - positions: top positionsByPnlTopN by profit, plus top positionsByVolumeTopN by volume
+ *               (accounts >= $10k), without duplicates. Why the volume rank: on 2026-11-16
+ *               the top 30 by profit were large, low-leverage accounts whose nearest BTC
+ *               liquidation was 16.7% away; the most active profitable traders run higher
+ *               leverage, and a probe of the top 167 by profit + volume found BTC short
+ *               liquidations 1.03% and 4.08% above the price.
+ * Input may be any traders list; floors and ranks are applied here.
+ */
+export function selectTraders(all: LeaderboardTrader[], o: TraderSelectionOptions = DEFAULT_TRADER_SELECTION) {
+  const byPnl = all.filter((t) => t.accountValueUsd >= o.minAccountValueUsd).sort((a, b) => b.monthPnlUsd - a.monthPnlUsd);
+  const byVolume = all
+    .filter((t) => t.accountValueUsd >= o.minAccountValueForVolumeUsd && Number.isFinite(t.monthVolumeUsd))
+    .sort((a, b) => b.monthVolumeUsd - a.monthVolumeUsd);
+  const orders = byPnl.slice(0, o.ordersTopN);
+  const seen = new Set<string>();
+  const positions: LeaderboardTrader[] = [];
+  for (const t of [...byPnl.slice(0, o.positionsByPnlTopN), ...byVolume.slice(0, o.positionsByVolumeTopN)]) {
+    const k = t.address.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    positions.push(t);
+  }
+  return { orders, positions };
 }
 
 // ---------- clearinghouseState (positions) ----------
@@ -162,21 +225,33 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 
 /** Structural counts from one fetch, printed at the phase boundary so a zero is loud. */
 export interface LevelsReport {
-  tradersKept: number;
-  tradersQueried: number;
-  requestsFailed: number;
-  positionsOnCoin: number;
+  /** Traders read from the leaderboard after floors and ranks (union of both sets). */
+  addressesRead: number;
+  /** Addresses whose positions were requested, and how many answered / failed. */
+  positionAddresses: number;
+  positionAddressesOk: number;
+  positionAddressesFailed: number;
+  /** Addresses whose open orders were requested, and how many answered / failed. */
+  orderAddresses: number;
+  orderAddressesOk: number;
+  orderAddressesFailed: number;
+  /** Requests not sent because the per-minute weight budget was used up (counted, not hidden). */
+  skippedByRateBudget: number;
+  /** Positions on this coin that carry a liquidation price (the Patient input). */
+  positionsWithLiquidationPx: number;
+  /** Resting limits and take-profits on this coin. */
   ordersOnCoin: number;
+  takeProfitsOnCoin: number;
+  /** Request weight spent by this fetch (Hyperliquid counts 1,200 per minute per IP). */
+  weightSpent: number;
   fromCache: boolean;
 }
 
 /** Options for HyperliquidLevelSource. */
-export interface HyperliquidSourceOptions {
+export interface HyperliquidSourceOptions extends Partial<TraderSelectionOptions> {
   fetch?: FetchLike;
-  /** Top traders kept from the leaderboard. Default 30. */
+  /** Old name of ordersTopN, still accepted. */
   topN?: number;
-  /** Minimum account value in USD. Default 100,000. */
-  minAccountValueUsd?: number;
   /** Parallel requests to api.hyperliquid.xyz. Default 6. */
   concurrency?: number;
   /** Per-request timeout for /info in ms. Default 8,000. */
@@ -185,8 +260,14 @@ export interface HyperliquidSourceOptions {
   leaderboardTimeoutMs?: number;
   /** How long the leaderboard stays fresh in ms. Default 6 hours. */
   leaderboardTtlMs?: number;
-  /** How long one coin's levels stay fresh in ms. Default 30 s. */
+  /** How long one coin's levels, and one address's answers, stay fresh in ms. Default 60 s. */
   levelsTtlMs?: number;
+  /**
+   * Request weight allowed per rolling minute. Default 1,100, under Hyperliquid's 1,200
+   * per IP. Weights from Hyperliquid's docs: clearinghouseState 2, frontendOpenOrders 20.
+   * A full refresh with the defaults costs 200 x 2 + 30 x 20 = 1,000.
+   */
+  weightBudgetPerMinute?: number;
   /** Optional disk cache for the trimmed leaderboard (server only). */
   diskCache?: { read(): Promise<string | null>; write(text: string): Promise<void> };
   /** Clock, injected for tests. */
@@ -194,6 +275,12 @@ export interface HyperliquidSourceOptions {
   /** Logger for structural counts. Default console.log. */
   log?: (line: string) => void;
 }
+
+/** Hyperliquid's documented weights for the two info calls we make. */
+export const HL_WEIGHT = { clearinghouseState: 2, frontendOpenOrders: 20 } as const;
+
+/** Raised instead of sending a request that would break the weight budget. */
+class RateBudgetSkip extends Error {}
 
 /**
  * Fetch JSON with a timeout. Throws on a non-2xx status or a timeout.
@@ -213,7 +300,7 @@ async function fetchJson(f: FetchLike, url: string, init: RequestInit, timeoutMs
 
 /**
  * Run tasks with at most `limit` in flight. Each result is either a value or an error.
- * Why: Hyperliquid rate-limits by IP; 30 traders x 2 calls at once would trip it.
+ * Why: Hyperliquid rate-limits by IP; 200 traders at once would trip it.
  */
 export async function mapLimited<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<Array<R | Error>> {
   const results: Array<R | Error> = new Array(items.length);
@@ -236,44 +323,77 @@ export async function mapLimited<T, R>(items: T[], limit: number, fn: (item: T) 
  * Source of trader levels with caching. One instance per server process.
  */
 export class HyperliquidLevelSource {
-  private readonly o: Required<Omit<HyperliquidSourceOptions, "diskCache">> & { diskCache?: HyperliquidSourceOptions["diskCache"] };
+  private readonly o: {
+    fetch: FetchLike;
+    selection: TraderSelectionOptions;
+    concurrency: number;
+    requestTimeoutMs: number;
+    leaderboardTimeoutMs: number;
+    leaderboardTtlMs: number;
+    levelsTtlMs: number;
+    weightBudgetPerMinute: number;
+    now: () => number;
+    log: (line: string) => void;
+    diskCache?: HyperliquidSourceOptions["diskCache"];
+  };
   private leaderboard: { at: number; traders: LeaderboardTrader[] } | null = null;
   private leaderboardInFlight: Promise<LeaderboardTrader[]> | null = null;
   private readonly coinCache = new Map<string, { at: number; levels: TraderLevels; report: LevelsReport }>();
+  /** Per-address answers ("clearinghouseState:0xabc"), shared by every coin. */
+  private readonly answerCache = new Map<string, { at: number; json: unknown }>();
+  /** Weight spent in the last minute, as (time, weight) pairs. */
+  private spent: Array<{ at: number; w: number }> = [];
 
   constructor(opts: HyperliquidSourceOptions = {}) {
     this.o = {
       fetch: opts.fetch ?? ((u, i) => fetch(u, i)),
-      topN: opts.topN ?? 30,
-      minAccountValueUsd: opts.minAccountValueUsd ?? 100_000,
+      selection: {
+        ordersTopN: opts.ordersTopN ?? opts.topN ?? DEFAULT_TRADER_SELECTION.ordersTopN,
+        positionsByPnlTopN: opts.positionsByPnlTopN ?? DEFAULT_TRADER_SELECTION.positionsByPnlTopN,
+        positionsByVolumeTopN: opts.positionsByVolumeTopN ?? DEFAULT_TRADER_SELECTION.positionsByVolumeTopN,
+        minAccountValueUsd: opts.minAccountValueUsd ?? DEFAULT_TRADER_SELECTION.minAccountValueUsd,
+        minAccountValueForVolumeUsd: opts.minAccountValueForVolumeUsd ?? DEFAULT_TRADER_SELECTION.minAccountValueForVolumeUsd,
+      },
       concurrency: opts.concurrency ?? 6,
       requestTimeoutMs: opts.requestTimeoutMs ?? 8_000,
       leaderboardTimeoutMs: opts.leaderboardTimeoutMs ?? 90_000,
       leaderboardTtlMs: opts.leaderboardTtlMs ?? 6 * 60 * 60 * 1000,
-      levelsTtlMs: opts.levelsTtlMs ?? 30_000,
+      levelsTtlMs: opts.levelsTtlMs ?? 60_000,
+      weightBudgetPerMinute: opts.weightBudgetPerMinute ?? 1_100,
       now: opts.now ?? Date.now,
       log: opts.log ?? ((l) => console.log(l)),
       diskCache: opts.diskCache,
     };
   }
 
+  /** The cache file must match the selection it was trimmed for, or it is ignored. */
+  private selectionKey(): string {
+    return `v2:${JSON.stringify(this.o.selection)}`;
+  }
+
   /**
-   * The kept traders. Order of preference: memory cache, disk cache, download.
-   * Concurrent callers share one download.
+   * The kept traders (union of both sets). Order of preference: memory cache, disk cache,
+   * download. Concurrent callers share one download.
    */
   async getTopTraders(): Promise<LeaderboardTrader[]> {
     const now = this.o.now();
     if (this.leaderboard && now - this.leaderboard.at < this.o.leaderboardTtlMs) return this.leaderboard.traders;
     if (this.leaderboardInFlight) return this.leaderboardInFlight;
     this.leaderboardInFlight = (async () => {
-      // Disk cache holds the TRIMMED list ({at, traders}), a few KB instead of 39 MB.
+      // Disk cache holds the TRIMMED list ({at, key, traders}), a few tens of KB instead of 39 MB.
       if (this.o.diskCache) {
         const text = await this.o.diskCache.read().catch(() => null);
         if (text) {
-          const cached = toObj(JSON.parse(text));
+          let cached: Record<string, unknown> = {};
+          try {
+            cached = toObj(JSON.parse(text));
+          } catch {
+            this.o.log("[levels] leaderboard disk cache unreadable, downloading again");
+          }
           const at = toNum(cached.at);
           const traders = toArr(cached.traders) as LeaderboardTrader[];
-          if (now - at < this.o.leaderboardTtlMs && traders.length > 0) {
+          // An older cache (other key, e.g. the 30-trader file from before 2026-11-16) is ignored.
+          if (cached.key === this.selectionKey() && now - at < this.o.leaderboardTtlMs && traders.length > 0) {
             this.leaderboard = { at, traders };
             this.o.log(`[levels] leaderboard from disk cache: kept ${traders.length}`);
             return traders;
@@ -282,16 +402,49 @@ export class HyperliquidLevelSource {
       }
       const json = await fetchJson(this.o.fetch, HL_LEADERBOARD_URL, { method: "GET" }, this.o.leaderboardTimeoutMs);
       const rowsRead = toArr(toObj(json).leaderboardRows).length;
-      const traders = parseLeaderboard(json, { topN: this.o.topN, minAccountValueUsd: this.o.minAccountValueUsd });
-      this.o.log(`[levels] leaderboard read: ${rowsRead} rows, kept: ${traders.length}`);
+      const all = parseLeaderboard(json, { topN: Infinity, minAccountValueUsd: Math.min(this.o.selection.minAccountValueUsd, this.o.selection.minAccountValueForVolumeUsd) });
+      const sel = selectTraders(all, this.o.selection);
+      const seen = new Set<string>();
+      const traders = [...sel.orders, ...sel.positions].filter((t) => !seen.has(t.address) && !!seen.add(t.address));
+      this.o.log(
+        `[levels] leaderboard read: ${rowsRead} rows, profitable above the floor: ${all.length}, kept: ${traders.length} (orders ${sel.orders.length}, positions ${sel.positions.length})`,
+      );
       if (traders.length === 0) throw new Error("Hyperliquid leaderboard gave zero usable traders");
       this.leaderboard = { at: now, traders };
-      if (this.o.diskCache) await this.o.diskCache.write(JSON.stringify(this.leaderboard)).catch(() => undefined);
+      if (this.o.diskCache) await this.o.diskCache.write(JSON.stringify({ at: now, key: this.selectionKey(), traders })).catch(() => undefined);
       return traders;
     })().finally(() => {
       this.leaderboardInFlight = null;
     });
     return this.leaderboardInFlight;
+  }
+
+  /** Weight spent in the last 60 s. */
+  private weightInLastMinute(now: number): number {
+    this.spent = this.spent.filter((x) => now - x.at < 60_000);
+    return this.spent.reduce((s, x) => s + x.w, 0);
+  }
+
+  /**
+   * One /info call for one address, from the per-address cache when fresh, else sent
+   * if the weight budget allows (else RateBudgetSkip).
+   */
+  private async info(type: "clearinghouseState" | "frontendOpenOrders", user: string): Promise<{ json: unknown; cached: boolean }> {
+    const key = `${type}:${user.toLowerCase()}`;
+    const now = this.o.now();
+    const hit = this.answerCache.get(key);
+    if (hit && now - hit.at < this.o.levelsTtlMs) return { json: hit.json, cached: true };
+    const w = HL_WEIGHT[type];
+    if (this.weightInLastMinute(now) + w > this.o.weightBudgetPerMinute) throw new RateBudgetSkip(key);
+    this.spent.push({ at: now, w });
+    const json = await fetchJson(
+      this.o.fetch,
+      HL_INFO_URL,
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type, user }) },
+      this.o.requestTimeoutMs,
+    );
+    this.answerCache.set(key, { at: now, json });
+    return { json, cached: false };
   }
 
   /**
@@ -304,45 +457,54 @@ export class HyperliquidLevelSource {
     if (hit && now - hit.at < this.o.levelsTtlMs) return { levels: hit.levels, report: { ...hit.report, fromCache: true } };
 
     const traders = await this.getTopTraders();
-    const post = (body: object) =>
-      fetchJson(
-        this.o.fetch,
-        HL_INFO_URL,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
-        this.o.requestTimeoutMs,
-      );
-    const results = await mapLimited(traders, this.o.concurrency, async (t) => {
-      const [state, orders] = await Promise.all([
-        post({ type: "clearinghouseState", user: t.address }),
-        post({ type: "frontendOpenOrders", user: t.address }),
-      ]);
-      return { liq: parseClearinghouseState(state, coin), ...parseFrontendOpenOrders(orders, coin) };
-    });
+    const sel = selectTraders(traders, this.o.selection);
+    const before = this.weightInLastMinute(now);
+    const posResults = await mapLimited(sel.positions, this.o.concurrency, async (t) => parseClearinghouseState((await this.info("clearinghouseState", t.address)).json, coin));
+    const ordResults = await mapLimited(sel.orders, this.o.concurrency, async (t) => parseFrontendOpenOrders((await this.info("frontendOpenOrders", t.address)).json, coin));
 
     const levels: TraderLevels = { limitLevels: [], takeProfitLevels: [], liquidationLevels: [] };
-    let failed = 0;
-    for (const r of results) {
-      if (r instanceof Error) {
-        failed++;
-        continue;
-      }
-      levels.liquidationLevels.push(...r.liq);
-      levels.limitLevels.push(...r.limits);
-      levels.takeProfitLevels.push(...r.takeProfits);
+    let posFailed = 0;
+    let ordFailed = 0;
+    let skipped = 0;
+    for (const r of posResults) {
+      if (r instanceof RateBudgetSkip) skipped++;
+      else if (r instanceof Error) posFailed++;
+      else levels.liquidationLevels.push(...r);
     }
+    for (const r of ordResults) {
+      if (r instanceof RateBudgetSkip) skipped++;
+      else if (r instanceof Error) ordFailed++;
+      else {
+        levels.limitLevels.push(...r.limits);
+        levels.takeProfitLevels.push(...r.takeProfits);
+      }
+    }
+    const posSkipped = posResults.filter((r) => r instanceof RateBudgetSkip).length;
+    const ordSkipped = ordResults.filter((r) => r instanceof RateBudgetSkip).length;
     const report: LevelsReport = {
-      tradersKept: traders.length,
-      tradersQueried: traders.length - failed,
-      requestsFailed: failed,
-      positionsOnCoin: levels.liquidationLevels.length,
-      ordersOnCoin: levels.limitLevels.length + levels.takeProfitLevels.length,
+      addressesRead: traders.length,
+      positionAddresses: sel.positions.length,
+      positionAddressesOk: sel.positions.length - posFailed - posSkipped,
+      positionAddressesFailed: posFailed,
+      orderAddresses: sel.orders.length,
+      orderAddressesOk: sel.orders.length - ordFailed - ordSkipped,
+      orderAddressesFailed: ordFailed,
+      skippedByRateBudget: skipped,
+      positionsWithLiquidationPx: levels.liquidationLevels.length,
+      ordersOnCoin: levels.limitLevels.length,
+      takeProfitsOnCoin: levels.takeProfitLevels.length,
+      weightSpent: this.weightInLastMinute(this.o.now()) - before,
       fromCache: false,
     };
     this.o.log(
-      `[levels] ${coin}: traders kept ${report.tradersKept}, queried ok ${report.tradersQueried}, failed ${failed}, positions ${report.positionsOnCoin}, orders ${report.ordersOnCoin}`,
+      `[levels] ${coin}: addresses read ${report.addressesRead}; positions asked ${report.positionAddresses}, ok ${report.positionAddressesOk}, failed ${posFailed}; ` +
+        `orders asked ${report.orderAddresses}, ok ${report.orderAddressesOk}, failed ${ordFailed}; skipped by rate budget ${skipped}; ` +
+        `positions with liquidationPx ${report.positionsWithLiquidationPx}; resting orders ${report.ordersOnCoin}; take-profits ${report.takeProfitsOnCoin}; weight ${report.weightSpent}`,
     );
     // Every request failing is an outage, not "no levels": say so loudly instead of returning empties.
-    if (traders.length > 0 && failed === traders.length) throw new Error(`all ${failed} Hyperliquid trader requests failed`);
+    const asked = sel.positions.length + sel.orders.length;
+    if (asked > 0 && posFailed + ordFailed === asked) throw new Error(`all ${asked} Hyperliquid trader requests failed`);
+    if (asked > 0 && skipped === asked) throw new Error(`all ${asked} Hyperliquid requests skipped: rate budget used up, try again in a minute`);
     this.coinCache.set(coin, { at: now, levels, report });
     return { levels, report };
   }

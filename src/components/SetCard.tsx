@@ -1,9 +1,14 @@
 /**
  * The Set card: one portrait (9:16) card, one big Enter button.
  *
- * Rows: Buy/Sell, Ticket, Leverage, Take-profit, When (Now / Nearby / Patient / Draw).
+ * Rows (owner rules 2026-11-16): Buy/Sell, Ticket ($10 / $30 / $100), Leverage (30x or
+ * 50x on the card, default 30x), then ONE tappable summary row such as
+ * "Deserved · Nearby ›" with the target price, win amount and max loss. Tapping it opens
+ * the options sheet (SetOptionsSheet.tsx): take-profit mode (default Deserved), when to
+ * enter (default Nearby) and 100x leverage as an advanced choice.
  * Nearby and Patient show "Checking traders' orders..." while the plan (which loads the
- * traders' levels) is fetched through TanStack Query, then the chosen price.
+ * traders' levels) is fetched through TanStack Query, then the chosen price. When Patient
+ * or Nearby falls back, the card itself says so (amber line), not only the sheet.
  * Draw swaps in the vertical price strip. After Enter: waiting/open status, progress bar
  * to take-profit, the halfway and result toasts, and the result with the fee split.
  *
@@ -14,13 +19,15 @@
 import { useMemo, useState } from "react";
 import styled from "styled-components";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { ArrowDownRight, ArrowUpRight, Bell, CheckCircle2, Loader2, Skull } from "lucide-react";
+import { ArrowDownRight, ArrowUpRight, Bell, CheckCircle2, ChevronRight, Loader2, ShieldAlert, Skull } from "lucide-react";
 import type { SetAlertEvent } from "../core/alerts";
 import { estimateLiquidationPrice } from "../core/liquidation";
-import { ENTRY_MODES, LEVERAGES, TICKETS_USD, TP_MODES, type DrawBands, type EntryMode, type Leverage, type SetInput, type Side, type TicketUsd, type TpMode } from "../core/types";
+import { CARD_LEVERAGES, DEFAULT_CHOICES, TICKETS_USD, type DrawBands, type EntryMode, type Leverage, type SetInput, type Side, type TicketUsd, type TpMode } from "../core/types";
 import type { SetCardApi } from "../api/client";
 import { theme } from "../theme";
 import { PriceStrip } from "./PriceStrip";
+import { SetOptionsSheet } from "./SetOptionsSheet";
+import { fallbackNotice, px, summaryLines, usd } from "./setSummary";
 import { useSetSession } from "./useSetSession";
 
 export interface SetCardProps {
@@ -30,20 +37,13 @@ export interface SetCardProps {
   onAlert?(e: SetAlertEvent): void;
 }
 
-const TP_LABEL: Record<TpMode, string> = { shy: "Shy", deserved: "Deserved", greedy: "Greedy" };
-const WHEN_LABEL: Record<EntryMode, string> = { now: "Now", nearby: "Nearby", patient: "Patient", draw: "Draw" };
-
-/** "$1,234.56" */
-const usd = (v: number) => `${v < 0 ? "-" : ""}$${Math.abs(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-/** Price with up to 2 decimals. */
-const px = (v: number | null | undefined) => (v == null ? "market" : v.toLocaleString(undefined, { maximumFractionDigits: 2 }));
-
 export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
-  const [side, setSide] = useState<Side>("buy");
-  const [ticketUsd, setTicket] = useState<TicketUsd>(30);
-  const [leverage, setLeverage] = useState<Leverage>(50);
-  const [tpMode, setTpMode] = useState<TpMode>("deserved");
-  const [entryMode, setEntryMode] = useState<EntryMode>("now");
+  const [side, setSide] = useState<Side>(DEFAULT_CHOICES.side);
+  const [ticketUsd, setTicket] = useState<TicketUsd>(DEFAULT_CHOICES.ticketUsd);
+  const [leverage, setLeverage] = useState<Leverage>(DEFAULT_CHOICES.leverage);
+  const [tpMode, setTpMode] = useState<TpMode>(DEFAULT_CHOICES.tpMode);
+  const [entryMode, setEntryMode] = useState<EntryMode>(DEFAULT_CHOICES.entryMode);
+  const [sheetOpen, setSheetOpen] = useState(false);
   const [bands, setBands] = useState<Partial<DrawBands>>({});
   const [painting, setPainting] = useState<"in" | "out">("in");
 
@@ -72,6 +72,10 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
   const inMid = bands.inBand ? (bands.inBand.low + bands.inBand.high) / 2 : undefined;
   const plan = preview.data?.plan;
   const loadingLevels = preview.isFetching && (entryMode === "nearby" || entryMode === "patient");
+  const summary = summaryLines(tpMode, entryMode, preview.isFetching ? null : plan);
+  const notice = preview.isFetching ? null : fallbackNotice(plan);
+  // 100x is chosen in the sheet; while it is on, the card shows it as a third, active option.
+  const cardLeverages: readonly Leverage[] = CARD_LEVERAGES.includes(leverage) ? CARD_LEVERAGES : [...CARD_LEVERAGES, leverage];
 
   return (
     <Card>
@@ -101,31 +105,21 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
       </Row>
       <Row label="Leverage">
         <Seg>
-          {LEVERAGES.map((l) => (
+          {cardLeverages.map((l) => (
             <Opt key={l} $on={leverage === l} onClick={() => setLeverage(l)} $mono>
               {l}x
             </Opt>
           ))}
         </Seg>
       </Row>
-      <Row label="Take-profit">
-        <Seg>
-          {TP_MODES.map((m) => (
-            <Opt key={m} $on={tpMode === m} onClick={() => setTpMode(m)}>
-              {TP_LABEL[m]}
-            </Opt>
-          ))}
-        </Seg>
-      </Row>
-      <Row label="When">
-        <Seg>
-          {ENTRY_MODES.map((m) => (
-            <Opt key={m} $on={entryMode === m} onClick={() => setEntryMode(m)}>
-              {WHEN_LABEL[m]}
-            </Opt>
-          ))}
-        </Seg>
-      </Row>
+      <Summary type="button" aria-haspopup="dialog" onClick={() => setSheetOpen(true)} data-testid="set-summary-row">
+        <SummaryText>
+          <SummaryTitle>{summary.title}</SummaryTitle>
+          <SummaryDetail>{summary.detail ?? (loadingLevels ? "Checking traders' orders..." : "...")}</SummaryDetail>
+        </SummaryText>
+        <ChevronRight size={20} />
+      </Summary>
+      {notice && <Warn data-testid="fallback-notice">{notice}</Warn>}
 
       {entryMode === "draw" && price.data && range && (
         <DrawBox>
@@ -155,12 +149,12 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
           <Muted>Paint an In band and an Out band.</Muted>
         ) : plan ? (
           <>
-            {plan.entry.fellBackFrom.length > 0 && <Warn>{plan.entry.reason}</Warn>}
             <Kv k="Entry" v={plan.entry.usedMode === "now" ? `market ~${px(plan.entry.expectedFillPrice)}` : px(plan.entry.expectedFillPrice)} />
-            <Kv k="Orders" v={`${plan.orders.entries.length} in / ${plan.orders.takeProfits.length} out`} />
+            <Kv k="Orders" v={`${plan.orders.entries.length} in / ${plan.orders.takeProfits.length} out / ${plan.orders.stops.length} stop`} />
             <Kv k="Take-profit" v={`${px(plan.takeProfit.price)} (${plan.takeProfit.ratio.toFixed(2)}x)`} tone={theme.color.success} />
-            <Kv k="Liquidation (stop)" v={px(plan.liquidationPrice)} tone={theme.color.negative} />
-            <Kv k="Win / lose" v={`${usd(plan.expected.profitAtTpUsd)} / ${usd(plan.expected.lossAtLiquidationUsd)}`} />
+            <Kv k="Stop" v={px(plan.stop.price)} tone={theme.color.negative} />
+            <Kv k="Liquidation" v={px(plan.liquidationPrice)} tone={theme.color.dim} />
+            <Kv k="Win / max loss" v={`${usd(plan.expected.profitAtTpUsd)} / ${usd(plan.expected.lossAtStopUsd)}`} />
           </>
         ) : (
           <Muted>...</Muted>
@@ -188,8 +182,8 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
               </Toast>
             ) : (
               <Toast key={i} $tone={e.outcome === "take-profit" ? theme.color.success : theme.color.negative}>
-                {e.outcome === "take-profit" ? <CheckCircle2 size={14} /> : <Skull size={14} />}
-                {e.outcome === "take-profit" ? "Take-profit hit" : "Liquidated"} at {px(e.price)}
+                {e.outcome === "take-profit" ? <CheckCircle2 size={14} /> : e.outcome === "stopped" ? <ShieldAlert size={14} /> : <Skull size={14} />}
+                {e.outcome === "take-profit" ? "Take-profit hit" : e.outcome === "stopped" ? "Stopped" : "Liquidated"} at {px(e.price)}
               </Toast>
             ),
           )}
@@ -203,6 +197,17 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
           )}
         </Status>
       )}
+
+      <SetOptionsSheet
+        open={sheetOpen}
+        tpMode={tpMode}
+        entryMode={entryMode}
+        leverage={leverage}
+        onTpMode={setTpMode}
+        onEntryMode={setEntryMode}
+        onLeverage={setLeverage}
+        onClose={() => setSheetOpen(false)}
+      />
     </Card>
   );
 }
@@ -228,6 +233,7 @@ function Kv({ k, v, tone }: { k: string; v: string; tone?: string }) {
 
 // ---------- styles (Blackboard tokens from ../theme) ----------
 const Card = styled.div`
+  position: relative; /* anchors the options sheet */
   /* Portrait card: full width on a phone, 420px at most; at least 9:16 tall (420 x 16 / 9 = 746px)
      but never taller than the screen, so the Enter button stays reachable. */
   flex: 0 1 420px;
@@ -288,6 +294,35 @@ const Opt = styled.button<{ $on: boolean; $tone?: string; $mono?: boolean }>`
   color: ${(p) => (p.$on ? (p.$tone ?? theme.color.text) : theme.color.muted)};
   background: ${(p) => (p.$on ? theme.color.surface3 : "transparent")};
   -webkit-tap-highlight-color: transparent;
+`;
+const Summary = styled.button`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-height: 56px;
+  padding: 10px 12px;
+  border: 1px solid ${theme.color.surface3};
+  border-radius: ${theme.radius.md};
+  background: ${theme.color.surface1};
+  color: ${theme.color.text};
+  cursor: pointer;
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+`;
+const SummaryText = styled.span`
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+`;
+const SummaryTitle = styled.span`
+  font: 600 15px ${theme.font.ui};
+`;
+const SummaryDetail = styled.span`
+  font: 500 12px ${theme.font.mono};
+  color: ${theme.color.muted};
 `;
 const DrawBox = styled.div`
   display: flex;

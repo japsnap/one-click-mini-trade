@@ -5,6 +5,7 @@
 export * from "./types";
 export * from "./rounding";
 export * from "./liquidation";
+export * from "./stop";
 export * from "./takeProfit";
 export * from "./nudge";
 export * from "./entry";

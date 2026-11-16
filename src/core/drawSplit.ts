@@ -14,11 +14,23 @@
  * A $10 ticket on BTC can end up as a single order.
  *
  * Draw ignores the Shy/Deserved/Greedy minimum (the user chose the Out band),
- * but still never allows a take-profit below 1x the liquidation distance.
+ * but still never allows a take-profit below 1x the risk.
+ *
+ * Stops (2026-11-16): every entry leg gets its own reduce-only stop-market at 85% of
+ * THAT leg's liquidation distance (stop.ts), paired by index with the entry and its
+ * take-profit, same quantity. Each leg's ratio is measured against its own stop:
+ *   ratio_i = |takeProfit_i - entry_i| / |entry_i - stop_i|, and the smallest must be >= 1.
+ * Why per leg: a leg may fill alone, and a stop computed from the average of all legs
+ * can sit beyond the liquidation of the leg that filled first. Known limit: when
+ * several legs fill, the combined position's liquidation is at their average entry,
+ * which can be nearer than the lowest leg's stop (Buy) on a wide In band; the stop
+ * re-check after each fill (server/execute.ts reconcileStop, using Aster's real
+ * positionRisk liquidationPrice) is what closes that gap.
  */
-import { estimateLiquidationPrice, liquidationDistance } from "./liquidation";
+import { estimateLiquidationPrice } from "./liquidation";
 import { nudgePrice, DEFAULT_NUDGE_FRACTION } from "./nudge";
 import { floorToStep, roundToTick } from "./rounding";
+import { DEFAULT_ASSUMED_MAINTENANCE_RATE, planStop, type MaintenanceSource } from "./stop";
 import { cleanRatio, RatioBelowOneError } from "./takeProfit";
 import type { DrawBands, PriceBand, RandomSource, Side, SymbolRules } from "./types";
 
@@ -37,12 +49,21 @@ export interface DrawPlan {
   entries: DrawLeg[];
   /** Reduce-only take-profits, lowest price first, paired by index with entries (same qty). */
   takeProfits: DrawLeg[];
+  /** Reduce-only stop-markets, one per entry (same index, same qty), each at 85% of that leg's liquidation distance. */
+  stops: DrawLeg[];
+  /** Estimated liquidation price of each leg on its own (same index as entries). */
+  legLiquidationPrices: number[];
   /** Quantity-weighted average entry price. Units: quote per base. */
   averageEntry: number;
   /** Liquidation estimate at the average entry, assuming every entry fills. */
   liquidationPrice: number;
-  /** Smallest ratio among the take-profits vs the liquidation distance. Always >= 1. */
+  /** Smallest per-leg ratio, take-profit distance vs that leg's stop distance. Always >= 1. */
   minRatio: number;
+  /** Loss if every leg fills and every stop fires. Units: USD, positive number. */
+  lossAtStopsUsd: number;
+  /** Maintenance margin rate used for the liquidation estimates (decimal) and where it came from. */
+  maintenanceMarginRate: number;
+  maintenanceSource: MaintenanceSource;
   /** Total quantity across entries. Units: base. */
   totalQty: number;
   /** Total notional at entry prices. Units: USD. */
@@ -114,9 +135,12 @@ export function splitDraw(args: {
   random: RandomSource;
   /** Max nudge fraction, default 0.0005 (0.05%). */
   nudgeFraction?: number;
-  /** Optional maintenance margin rate for the liquidation estimate. */
+  /** Maintenance margin rate for the liquidation estimates. Default: the assumed 0.5% (stop.ts). */
   maintenanceMarginRate?: number;
+  maintenanceSource?: MaintenanceSource;
 }): DrawPlan {
+  const mmr = args.maintenanceMarginRate ?? DEFAULT_ASSUMED_MAINTENANCE_RATE;
+  const mmrSource: MaintenanceSource = args.maintenanceSource ?? "assumed";
   const { side, bands, rules } = args;
   validateBands(side, bands);
   const notional = args.ticketUsd * args.leverage; // position size in USD
@@ -149,13 +173,35 @@ export function splitDraw(args: {
     const totalQty = entries.reduce((s, l) => s + l.qty, 0);
     const totalNotionalUsd = entries.reduce((s, l) => s + l.qty * l.price, 0);
     const averageEntry = totalNotionalUsd / totalQty; // quantity-weighted average price
-    const liq = estimateLiquidationPrice(averageEntry, args.leverage, side, args.maintenanceMarginRate ?? 0);
-    const liqDist = liquidationDistance(averageEntry, liq);
-    // The nearest take-profit sets the floor: it must still pay at least 1x the risk.
-    const rewards = takeProfits.map((t) => (side === "buy" ? t.price - averageEntry : averageEntry - t.price));
-    const minRatio = cleanRatio(Math.min(...rewards) / liqDist);
+    const liq = estimateLiquidationPrice(averageEntry, args.leverage, side, mmr);
+    // One stop per leg, from that leg's own entry (see the header for why).
+    const legStops = entries.map((e) =>
+      planStop({ entry: e.price, side, leverage: args.leverage, tickSize: rules.tickSize, maintenanceMarginRate: mmr, maintenanceSource: mmrSource }),
+    );
+    const stops: DrawLeg[] = legStops.map((st, i) => ({ price: st.stopPrice, qty: entries[i]?.qty ?? 0 }));
+    // Every leg must still pay at least 1x its own risk (reward / stop distance).
+    const ratios = takeProfits.map((t, i) => {
+      const e = entries[i] as DrawLeg;
+      const reward = side === "buy" ? t.price - e.price : e.price - t.price;
+      return reward / (legStops[i] as { riskDistance: number }).riskDistance;
+    });
+    const minRatio = cleanRatio(Math.min(...ratios));
     if (!(minRatio >= 1)) throw new RatioBelowOneError(minRatio);
-    return { entries, takeProfits, averageEntry, liquidationPrice: liq, minRatio, totalQty, totalNotionalUsd };
+    const lossAtStopsUsd = entries.reduce((s, e, i) => s + e.qty * (legStops[i] as { riskDistance: number }).riskDistance, 0);
+    return {
+      entries,
+      takeProfits,
+      stops,
+      legLiquidationPrices: legStops.map((st) => st.liquidationPrice),
+      averageEntry,
+      liquidationPrice: liq,
+      minRatio,
+      lossAtStopsUsd,
+      maintenanceMarginRate: mmr,
+      maintenanceSource: mmrSource,
+      totalQty,
+      totalNotionalUsd,
+    };
   }
   throw new TicketTooSmallError(notional, perOrderMin);
 }

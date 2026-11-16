@@ -60,6 +60,8 @@ export function useSetSession(args: {
         entry: plan.entry.expectedFillPrice,
         takeProfit: plan.takeProfit.price,
         liquidation: plan.liquidationPrice,
+        // Draw has one stop per leg; the session follows the average (the plan shows it the same way).
+        stop: plan.stop.price,
         qty: plan.quantity,
       }
     : null;

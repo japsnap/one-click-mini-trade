@@ -4,8 +4,9 @@
  * Two kinds of event:
  *  - "halfway": price has covered half the way from entry to take-profit
  *    (fires once per Set, and never after the result is in);
- *  - "result": the take-profit was hit, or the liquidation price was reached
- *    (fires once; after it, the Set is closed and nothing else fires).
+ *  - "result": the take-profit was hit, the stop fired (2026-11-16: a stop-market at
+ *    85% of the liquidation distance), or, for a Set without a stop, the liquidation
+ *    price was reached (fires once; after it, the Set is closed and nothing else fires).
  *
  * The function is pure: you pass the previous state and a new price, and get the
  * new state plus any events. That keeps it framework-free and testable; the card
@@ -21,6 +22,8 @@ export interface OpenSet {
   entry: number;
   takeProfit: number;
   liquidation: number;
+  /** Stop trigger price. When set, the stop closes the Set before liquidation can. */
+  stop?: number;
   /** Filled quantity. */
   qty: number;
 }
@@ -28,15 +31,18 @@ export interface OpenSet {
 /** What has already fired. Start with INITIAL_WATCH_STATE. */
 export interface WatchState {
   halfwayFired: boolean;
-  result: null | "take-profit" | "liquidated";
+  result: null | SetOutcome;
 }
+
+/** How a Set ended. "stopped" = our stop fired; "liquidated" = the venue closed it (no stop, or a gap past the stop). */
+export type SetOutcome = "take-profit" | "stopped" | "liquidated";
 
 export const INITIAL_WATCH_STATE: WatchState = { halfwayFired: false, result: null };
 
 /** An alert event. */
 export type SetAlertEvent =
   | { type: "halfway"; price: number; progress: number }
-  | { type: "result"; outcome: "take-profit" | "liquidated"; price: number; pnlUsd: number; fees: FeeSplit };
+  | { type: "result"; outcome: SetOutcome; price: number; pnlUsd: number; fees: FeeSplit };
 
 /**
  * Share of the way from entry to take-profit, clamped to [0, 1].
@@ -72,11 +78,16 @@ export function evaluatePrice(set: OpenSet, state: WatchState, price: number): {
   const hitTp = isLong ? price >= set.takeProfit : price <= set.takeProfit;
   // Liquidation happens when price reaches the liquidation level against us.
   const hitLiq = isLong ? price <= set.liquidation : price >= set.liquidation;
+  // The stop sits between entry and liquidation, so on a falling (long) path it is met first.
+  const hitStop = set.stop !== undefined && (isLong ? price <= set.stop : price >= set.stop);
 
-  if (hitTp || hitLiq) {
-    const outcome = hitTp ? "take-profit" : "liquidated";
+  if (hitTp || hitStop || hitLiq) {
+    // A price feed that jumps past both the stop and liquidation between two ticks is
+    // reported as "stopped" at the stop: the stop order was resting and triggers first
+    // on the venue's mark price. (A real gap can still fill a stop-market worse.)
+    const outcome: SetOutcome = hitTp ? "take-profit" : hitStop ? "stopped" : "liquidated";
     // Settle at the level itself (the order's trigger), not the tick that crossed it.
-    const settle = hitTp ? set.takeProfit : set.liquidation;
+    const settle = hitTp ? set.takeProfit : hitStop ? (set.stop as number) : set.liquidation;
     const pnlUsd = pnlAt(set, settle);
     events.push({ type: "result", outcome, price: settle, pnlUsd, fees: splitFees(pnlUsd) });
     return { state: { ...state, result: outcome }, events };

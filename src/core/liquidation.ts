@@ -1,10 +1,10 @@
 /**
  * Liquidation price estimate for an isolated-margin perpetual position.
  *
- * A Set has no stop-loss on purpose: the liquidation price IS the stop, and the
- * ticket (the margin) is the most the user can lose. This file estimates where
- * that liquidation sits, so the take-profit can be placed at a multiple of the
- * same distance (see takeProfit.ts).
+ * Since 2026-11-16 a Set carries a stop just before liquidation (stop.ts: 85% of the
+ * liquidation distance), and the take-profit is measured against that stop distance
+ * (takeProfit.ts). This file estimates where liquidation sits, which is where the stop
+ * distance comes from. On isolated margin the ticket stays the most the user can lose.
  *
  * The basic estimate ignores maintenance margin:
  *   Buy (long):   liq = entry x (1 - 1/leverage)

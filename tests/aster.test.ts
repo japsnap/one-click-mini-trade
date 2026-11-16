@@ -13,7 +13,11 @@ import {
   AsterClient,
   asterTypedData,
   createNonceSource,
+  parseDepth,
+  parseLeverageBrackets,
+  parsePositionRisk,
   parseSymbolRules,
+  stopFromPositionRisk,
   privateKeySigner,
   pyUrlencode,
   recoverAsterSigner,
@@ -158,5 +162,80 @@ describe("exchangeInfo parsing", () => {
     const broken = { symbols: [{ symbol: "BTCUSDT", status: "TRADING", filters: [] }] };
     expect(() => parseSymbolRules(broken, "BTCUSDT")).toThrow(/tickSize missing/);
     expect(() => parseSymbolRules({}, "BTCUSDT")).toThrow(/no symbols/);
+  });
+});
+
+describe("order book, brackets and positionRisk parsing", () => {
+  const depthJson = JSON.parse(readFileSync(new URL("./fixtures/aster-depth-BTCUSDT.json", import.meta.url), "utf8"));
+  it("depth: the real BTCUSDT capture becomes USD-weighted bids and asks (REAL)", () => {
+    const d = parseDepth(depthJson);
+    expect(d.bids).toHaveLength(1000);
+    expect(d.asks).toHaveLength(1000);
+    expect(d.skipped).toBe(0);
+    expect(d.bids[0]).toEqual({ price: 64426, weightUsd: 64426 * 1.541 });
+    expect(d.asks[0]!.price).toBe(64426.2);
+    expect(d.asks[0]!.price).toBeGreaterThan(d.bids[0]!.price);
+  });
+  it("depth: junk rows are skipped and counted, never trusted (negative)", () => {
+    const d = parseDepth({ bids: [["x", "1"], ["100", "0"], ["99", "2"]], asks: "oops" });
+    expect(d.bids).toEqual([{ price: 99, weightUsd: 198 }]);
+    expect(d.asks).toEqual([]);
+    expect(d.skipped).toBe(2);
+    expect(parseDepth(null)).toEqual({ bids: [], asks: [], skipped: 0 });
+  });
+  it("leverage brackets: both documented shapes; missing or malformed fails loudly (negative)", () => {
+    // Shape from the V3 doc "Notional and Leverage Brackets" example.
+    const one = { symbol: "ETHUSDT", brackets: [{ bracket: 1, initialLeverage: 75, notionalCap: 10000, notionalFloor: 0, maintMarginRatio: 0.0065, cum: 0 }] };
+    expect(parseLeverageBrackets(one, "ETHUSDT")).toEqual([{ notionalFloor: 0, notionalCap: 10000, initialLeverage: 75, maintMarginRatio: 0.0065 }]);
+    expect(parseLeverageBrackets([one], "ETHUSDT")).toHaveLength(1);
+    expect(() => parseLeverageBrackets([one], "BTCUSDT")).toThrow(/no brackets/);
+    expect(() => parseLeverageBrackets({ symbol: "ETHUSDT", brackets: [{ notionalFloor: 0, notionalCap: 0, initialLeverage: 75, maintMarginRatio: 0.0065 }] }, "ETHUSDT")).toThrow(/malformed/);
+  });
+  it("positionRisk: picks the open row, reads string numbers; the stop is 85% of the venue's distance", () => {
+    // Field names from the V3 doc "Position Information v3" example.
+    const rows = [
+      { symbol: "BTCUSDT", positionSide: "LONG", positionAmt: "20.000", entryPrice: "6563.66500", liquidationPrice: "5930.78", markPrice: "6679.5" },
+      { symbol: "BTCUSDT", positionSide: "SHORT", positionAmt: "-10.000", entryPrice: "6600", liquidationPrice: "7189.95", markPrice: "6679.5" },
+    ];
+    const long = parsePositionRisk(rows, "BTCUSDT", "LONG")!;
+    expect(long).toMatchObject({ positionAmt: 20, entryPrice: 6563.665, liquidationPrice: 5930.78 });
+    // 6,563.665 - 0.85 x 632.885 = 6,025.71275 -> toward entry on a 0.1 tick: 6,025.8
+    expect(stopFromPositionRisk(long, 0.1)).toEqual({ side: "buy", stopPrice: 6025.8 });
+    expect(stopFromPositionRisk(parsePositionRisk(rows, "BTCUSDT", "SHORT")!, 0.1).side).toBe("sell");
+    expect(parsePositionRisk([{ symbol: "BTCUSDT", positionAmt: "0.000" }], "BTCUSDT")).toBeNull();
+    expect(() => stopFromPositionRisk({ ...long, liquidationPrice: 0 }, 0.1)).toThrow(/no liquidation price/);
+  });
+});
+
+describe("OTOCO strategy request (HYBRID: fake fetch, real signature)", () => {
+  it("sends three legs in one signed request, builder fields included, signature recovers", async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const f = async (url: string, init?: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify({ strategyId: 9, strategyType: "OTOCO", failureCode: 0 }));
+    };
+    const s = privateKeySigner(DEMO_KEY);
+    const c = new AsterClient({
+      fetch: f,
+      auth: { user: DEMO_USER, signer: DEMO_SIGNER, sign: s.sign },
+      builder: validateBuilder({ address: "0xecD0674915473B0F2D9061dc6a004f18E29a882E", feeRate: "0.0001" }),
+      nonce: () => "7",
+    });
+    const base = { securityType: "USDT_FUTURES" as const, symbol: "BTCUSDT" };
+    await c.placeOtoco(
+      { ...base, strategySubId: "1", side: "BUY", type: "MARKET", quantity: "0.001" },
+      { ...base, strategySubId: "2", side: "SELL", type: "TAKE_PROFIT_MARKET", quantity: "0.001", stopPrice: "70000.0" },
+      { ...base, strategySubId: "3", side: "SELL", type: "STOP_MARKET", quantity: "0.001", stopPrice: "62000.0" },
+    );
+    const body = String(calls[0]!.init?.body);
+    expect(calls[0]!.url).toBe("https://fapi.asterdex.com/fapi/v3/placeStrategyOrder");
+    const [msg, sig] = body.split("&signature=");
+    const params = new URLSearchParams(msg);
+    expect(params.get("strategyType")).toBe("OTOCO");
+    const legs = JSON.parse(params.get("subOrderList")!);
+    expect(legs.map((l: { type: string }) => l.type)).toEqual(["MARKET", "TAKE_PROFIT_MARKET", "STOP_MARKET"]);
+    expect(params.get("builder")).toBe("0xecD0674915473B0F2D9061dc6a004f18E29a882E");
+    expect(params.get("feeRate")).toBe("0.0001");
+    expect(await recoverAsterSigner(msg!, sig as `0x${string}`)).toBe(DEMO_SIGNER);
   });
 });

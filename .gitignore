@@ -8,3 +8,4 @@ dist/
 # Local caches and order-plan logs written by the demo server.
 .cache/
 logs/
+.DS_Store

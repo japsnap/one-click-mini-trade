@@ -18,9 +18,16 @@ export type Side = "buy" | "sell";
 export type TicketUsd = 10 | 30 | 100;
 export const TICKETS_USD: readonly TicketUsd[] = [10, 30, 100];
 
-/** Allowed leverage multipliers. Position size = ticket x leverage. */
+/**
+ * Allowed leverage multipliers. Position size = ticket x leverage.
+ * LEVERAGES is what core validation accepts (30x, 50x, 100x). The card shows only
+ * CARD_LEVERAGES (30x, 50x); 100x is an advanced choice inside the options sheet
+ * (owner rule 2026-11-16), so ADVANCED_LEVERAGES lists it separately.
+ */
 export type Leverage = 30 | 50 | 100;
 export const LEVERAGES: readonly Leverage[] = [30, 50, 100];
+export const CARD_LEVERAGES: readonly Leverage[] = [30, 50];
+export const ADVANCED_LEVERAGES: readonly Leverage[] = [100];
 
 /** Take-profit appetite. Each mode sets a minimum reward-to-risk ratio (see takeProfit.ts). */
 export type TpMode = "shy" | "deserved" | "greedy";
@@ -105,3 +112,52 @@ export interface DrawBands {
 
 /** A source of random numbers in [0, 1). Injected so tests can be exact. Math.random fits. */
 export type RandomSource = () => number;
+
+/**
+ * Seeded random source (mulberry32): the same seed always gives the same sequence.
+ * Why: Nearby, the take-profit zone and the nudge all draw random numbers; a seed lets a
+ * test, a replay or a support case reproduce one Set's exact prices. Production should
+ * use a cryptographic source instead (the demo server uses node:crypto randomInt).
+ * Units: seed any 32-bit integer; output in [0, 1).
+ */
+export function seededRandom(seed: number): RandomSource {
+  let a = seed | 0;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * The venue's own order book (Aster public GET /fapi/v3/depth), as USD-weighted levels.
+ * bids = resting buy orders below the price, asks = resting sell orders above it.
+ * Used by the take-profit to find a wall of resting volume to stop just in front of.
+ * Units: price quote per base; weightUsd = price x quantity.
+ */
+export interface OrderBookDepth {
+  bids: Level[];
+  asks: Level[];
+}
+
+/**
+ * One notional bracket from Aster's leverage brackets (signed GET /fapi/v3/leverageBrackets).
+ * The maintenance margin rate depends on how big the position is.
+ * Units: notional in USD; maintMarginRatio a decimal fraction (0.004 = 0.4%).
+ */
+export interface LeverageBracket {
+  notionalFloor: number;
+  notionalCap: number;
+  initialLeverage: number;
+  maintMarginRatio: number;
+}
+
+/** The card's starting choices (owner rules 2026-11-16). */
+export const DEFAULT_CHOICES = {
+  side: "buy" as Side,
+  ticketUsd: 10 as TicketUsd,
+  leverage: 30 as Leverage,
+  tpMode: "deserved" as TpMode,
+  entryMode: "nearby" as EntryMode,
+};

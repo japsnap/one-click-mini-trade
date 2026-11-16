@@ -29,7 +29,8 @@
  */
 import { privateKeyToAccount } from "viem/accounts";
 import { recoverTypedDataAddress, zeroAddress, type Hex } from "viem";
-import type { SymbolRules } from "../core/types";
+import { stopPriceFromLiquidation, STOP_FRACTION_OF_LIQUIDATION } from "../core/stop";
+import type { Level, LeverageBracket, OrderBookDepth, Side, SymbolRules } from "../core/types";
 
 /** Mainnet host from the V3 doc. Testnet: https://fapi.asterdex-testnet.com */
 export const ASTER_MAINNET_URL = "https://fapi.asterdex.com";
@@ -147,10 +148,10 @@ export function validateBuilder(cfg: { address: string; feeRate: string }, maxFe
 export interface NewOrderParams {
   symbol: string;
   side: "BUY" | "SELL";
-  type: "MARKET" | "LIMIT" | "TAKE_PROFIT_MARKET";
+  type: "MARKET" | "LIMIT" | "TAKE_PROFIT_MARKET" | "STOP_MARKET";
   quantity?: string;
   price?: string;
-  /** LIMIT needs GTC; TAKE_PROFIT_MARKET accepts only GTC if sent. */
+  /** LIMIT needs GTC; TAKE_PROFIT_MARKET and STOP_MARKET accept only GTC if sent. */
   timeInForce?: "GTC";
   stopPrice?: string;
   /** "true" makes the order only shrink a position. Not allowed in Hedge Mode or with closePosition. */
@@ -172,7 +173,7 @@ export interface StrategySubOrder {
   symbol: string;
   side: "BUY" | "SELL";
   positionSide?: "BOTH" | "LONG" | "SHORT";
-  type: "LIMIT" | "MARKET" | "TAKE_PROFIT_MARKET";
+  type: "LIMIT" | "MARKET" | "TAKE_PROFIT_MARKET" | "STOP_MARKET";
   quantity?: string;
   price?: string;
   stopPrice?: string;
@@ -182,6 +183,10 @@ export interface StrategySubOrder {
   firstDrivenId?: string;
   firstDrivenOn?: "NEW" | "PARTIALLY_FILLED_OR_FILLED" | "FILLED";
   firstTrigger?: "PLACE_ORDER" | "CANCEL_ORDER";
+  /** Second trigger (OTOCO): e.g. the stop is cancelled when the take-profit fills, and the other way round. */
+  secondDrivenId?: string;
+  secondDrivenOn?: "PARTIALLY_FILLED_OR_FILLED" | "FILLED";
+  secondTrigger?: "PLACE_ORDER" | "CANCEL_ORDER";
 }
 
 /** Options for AsterClient. */
@@ -235,6 +240,109 @@ export function parseSymbolRules(exchangeInfo: unknown, symbol: string): SymbolR
 }
 
 /**
+ * Parse public GET /fapi/v3/depth into USD-weighted levels.
+ * Shape (V3 doc "Order Book"): {"lastUpdateId", "E", "T", "bids": [["price","qty"], ...], "asks": [...]}.
+ * Every row is coerced; a malformed row is skipped, never trusted. weightUsd = price x qty.
+ * Units: price quote per base; weight USD.
+ */
+export function parseDepth(json: unknown): OrderBookDepth & { skipped: number } {
+  const o = json !== null && typeof json === "object" ? (json as Record<string, unknown>) : {};
+  let skipped = 0;
+  const side = (rows: unknown): Level[] => {
+    const out: Level[] = [];
+    for (const r of Array.isArray(rows) ? rows : []) {
+      const price = num(Array.isArray(r) ? r[0] : undefined);
+      const qty = num(Array.isArray(r) ? r[1] : undefined);
+      if (!(price > 0) || !(qty > 0)) {
+        skipped++;
+        continue;
+      }
+      out.push({ price, weightUsd: price * qty });
+    }
+    return out;
+  };
+  return { bids: side(o.bids), asks: side(o.asks), skipped };
+}
+
+/**
+ * Parse signed GET /fapi/v3/leverageBrackets for one symbol into LeverageBracket rows.
+ * Accepts both documented shapes: an array of {symbol, brackets} or one {symbol, brackets}.
+ * Throws when the symbol or its brackets are missing (a silent empty list would quietly
+ * switch the stop to the assumed rate).
+ * Units: notional USD; maintMarginRatio decimal.
+ */
+export function parseLeverageBrackets(json: unknown, symbol: string): LeverageBracket[] {
+  const list = Array.isArray(json) ? json : [json];
+  const entry = list.find((x) => (x as { symbol?: unknown })?.symbol === symbol) as { brackets?: unknown } | undefined;
+  if (!entry || !Array.isArray(entry.brackets)) throw new Error(`leverageBrackets has no brackets for ${symbol}`);
+  const out: LeverageBracket[] = [];
+  for (const b of entry.brackets as Array<Record<string, unknown>>) {
+    const row: LeverageBracket = {
+      notionalFloor: num(b?.notionalFloor),
+      notionalCap: num(b?.notionalCap),
+      initialLeverage: num(b?.initialLeverage),
+      maintMarginRatio: num(b?.maintMarginRatio),
+    };
+    if (!(row.notionalFloor >= 0) || !(row.notionalCap > row.notionalFloor) || !(row.initialLeverage >= 1) || !(row.maintMarginRatio >= 0 && row.maintMarginRatio < 1)) {
+      throw new Error(`leverageBrackets ${symbol}: malformed bracket ${JSON.stringify(b)}`);
+    }
+    out.push(row);
+  }
+  if (out.length === 0) throw new Error(`leverageBrackets ${symbol}: empty`);
+  return out.sort((a, b) => a.notionalFloor - b.notionalFloor);
+}
+
+/** One open position as read from positionRisk. Units: prices quote per base; amount base (negative = short). */
+export interface PositionRiskRow {
+  symbol: string;
+  positionSide: "BOTH" | "LONG" | "SHORT";
+  positionAmt: number;
+  entryPrice: number;
+  liquidationPrice: number;
+  markPrice: number;
+}
+
+/**
+ * Parse signed GET /fapi/v3/positionRisk (V3 doc "Position Information v3") and return
+ * the open position on `symbol`, or null when there is none (positionAmt 0).
+ * Strings are coerced; "liquidationPrice": "0" means none known and is returned as 0.
+ * hedgePositionSide: in Hedge Mode pass "LONG" or "SHORT" to pick the right row.
+ */
+export function parsePositionRisk(json: unknown, symbol: string, hedgePositionSide?: "LONG" | "SHORT"): PositionRiskRow | null {
+  const rows = Array.isArray(json) ? json : [json];
+  for (const r of rows as Array<Record<string, unknown>>) {
+    if (r?.symbol !== symbol) continue;
+    const positionSide = (typeof r.positionSide === "string" ? r.positionSide : "BOTH") as PositionRiskRow["positionSide"];
+    if (hedgePositionSide && positionSide !== hedgePositionSide) continue;
+    const positionAmt = num(r.positionAmt);
+    if (!Number.isFinite(positionAmt) || positionAmt === 0) continue;
+    return {
+      symbol,
+      positionSide,
+      positionAmt,
+      entryPrice: num(r.entryPrice),
+      liquidationPrice: num(r.liquidationPrice),
+      markPrice: num(r.markPrice),
+    };
+  }
+  return null;
+}
+
+/**
+ * The stop recomputed from the exchange's own figures after a fill:
+ * 85% of the distance from Aster's entryPrice to Aster's liquidationPrice.
+ * Throws when the venue reports no usable liquidation price (0 or missing): the caller
+ * must keep the existing stop and say so, never guess.
+ * Units: prices quote per base.
+ */
+export function stopFromPositionRisk(row: PositionRiskRow, tickSize: number, fraction = STOP_FRACTION_OF_LIQUIDATION): { side: Side; stopPrice: number } {
+  if (!(row.liquidationPrice > 0)) throw new Error(`positionRisk ${row.symbol}: no liquidation price reported`);
+  if (!(row.entryPrice > 0)) throw new Error(`positionRisk ${row.symbol}: no entry price reported`);
+  const side: Side = row.positionAmt > 0 ? "buy" : "sell";
+  return { side, stopPrice: stopPriceFromLiquidation(row.entryPrice, row.liquidationPrice, side, tickSize, fraction) };
+}
+
+/**
  * The client. Public calls need nothing; signed calls need `auth`.
  */
 export class AsterClient {
@@ -246,6 +354,7 @@ export class AsterClient {
   private readonly nextNonce: () => string;
   private readonly timeoutMs: number;
   private rulesCache = new Map<string, { at: number; rules: SymbolRules }>();
+  private depthCache = new Map<string, { at: number; depth: OrderBookDepth & { skipped: number } }>();
 
   constructor(o: AsterClientOptions = {}) {
     this.baseUrl = (o.baseUrl || ASTER_MAINNET_URL).replace(/\/+$/, "");
@@ -328,6 +437,22 @@ export class AsterClient {
     return rules;
   }
 
+  /**
+   * Public order book, GET /fapi/v3/depth. limit 1000 (weight 20) reaches about 5-6%
+   * either side of the BTC price (checked 2026-11-16). Cached 5 s per symbol so a card
+   * re-rendering does not hammer the venue. Units: price quote per base; weight USD.
+   */
+  async getDepth(symbol: string, limit: 5 | 10 | 20 | 50 | 100 | 500 | 1000 = 1000): Promise<OrderBookDepth & { skipped: number }> {
+    const key = `${symbol}:${limit}`;
+    const hit = this.depthCache.get(key);
+    if (hit && Date.now() - hit.at < 5_000) return hit.depth;
+    const j = await this.send("GET", "/fapi/v3/depth", pyUrlencode([["symbol", symbol], ["limit", String(limit)]]));
+    const depth = parseDepth(j);
+    if (depth.bids.length === 0 && depth.asks.length === 0) throw new Error(`Aster depth for ${symbol} came back empty`);
+    this.depthCache.set(key, { at: Date.now(), depth });
+    return depth;
+  }
+
   /** Latest trade price. Units: quote per base. */
   async getPrice(symbol: string): Promise<{ symbol: string; price: number; time: number }> {
     const j = (await this.send("GET", "/fapi/v3/ticker/price", pyUrlencode([["symbol", symbol]]))) as Record<string, unknown>;
@@ -376,10 +501,25 @@ export class AsterClient {
    * the second (take-profit) once it fills. Builder fields are documented on this endpoint.
    * The response can be HTTP 200 with failureCode set; that is thrown as an error.
    */
-  async placeOto(entry: StrategySubOrder, takeProfit: StrategySubOrder, clientStrategyId?: string) {
+  placeOto(entry: StrategySubOrder, takeProfit: StrategySubOrder, clientStrategyId?: string) {
+    return this.placeStrategy("OTO", [entry, takeProfit], clientStrategyId);
+  }
+
+  /**
+   * POST /fapi/v3/placeStrategyOrder with strategyType OTOCO (exactly 3 legs): the entry
+   * places the take-profit AND the stop once it fills; whichever of those two fills
+   * cancels the other. This is how a live Set is sent since 2026-11-16. The builder
+   * fields sit on the request, so they cover all three legs, the stop included.
+   */
+  placeOtoco(entry: StrategySubOrder, takeProfit: StrategySubOrder, stop: StrategySubOrder, clientStrategyId?: string) {
+    return this.placeStrategy("OTOCO", [entry, takeProfit, stop], clientStrategyId);
+  }
+
+  /** Shared body of the strategy calls. Throws on HTTP 200 with a failureCode. */
+  private async placeStrategy(type: "OTO" | "OTOCO", legs: StrategySubOrder[], clientStrategyId?: string) {
     const params: Array<[string, string]> = [];
     if (clientStrategyId) params.push(["clientStrategyId", clientStrategyId]);
-    params.push(["strategyType", "OTO"], ["subOrderList", JSON.stringify([entry, takeProfit])]);
+    params.push(["strategyType", type], ["subOrderList", JSON.stringify(legs)]);
     const j = (await this.signed("POST", "/fapi/v3/placeStrategyOrder", this.withBuilder(params))) as Record<string, unknown>;
     const failureCode = num(j?.failureCode);
     if (Number.isFinite(failureCode) && failureCode !== 0) {
@@ -401,5 +541,14 @@ export class AsterClient {
   /** GET /fapi/v3/positionRisk (Position Information v3). Also the cheapest credential probe. */
   positionRisk(symbol?: string) {
     return this.signed("GET", "/fapi/v3/positionRisk", symbol ? [["symbol", symbol]] : []);
+  }
+
+  /**
+   * GET /fapi/v3/leverageBrackets (signed, USER_DATA): the maintenance margin rate per
+   * notional bracket, used for the liquidation estimate before the fill. Signed, so the
+   * demo server calls it only in live mode; trial mode uses the assumed rate (stop.ts).
+   */
+  async leverageBrackets(symbol: string): Promise<LeverageBracket[]> {
+    return parseLeverageBrackets(await this.signed("GET", "/fapi/v3/leverageBrackets", [["symbol", symbol]]), symbol);
   }
 }

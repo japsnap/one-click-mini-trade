@@ -3,20 +3,32 @@
  *
  * This is the one function both the preview and the placement use, so the recipe
  * is identical. Placement rebuilds the plan on the server with a fresh price and a
- * fresh nudge (it never trusts a plan sent by a client), so the placed numbers can
- * differ slightly from the preview; the card shows the placed plan after Enter. It only computes; it never
- * talks to a network. Inputs come from the exchange (price, symbol rules) and the
- * level source (skilled traders' orders and positions).
+ * fresh random draw (it never trusts a plan sent by a client), so the placed numbers
+ * can differ slightly from the preview; the card shows the placed plan after Enter. It
+ * only computes; it never talks to a network. Inputs come from the exchange (price,
+ * symbol rules, order book, leverage brackets) and the level source (skilled traders'
+ * orders and positions on Hyperliquid).
+ *
+ * Every Set is three orders per entry (since 2026-11-16):
+ *   entry  (market or limit)
+ *   take-profit  (reduce-only TAKE_PROFIT_MARKET; takeProfit.ts)
+ *   stop         (reduce-only STOP_MARKET at 85% of the liquidation distance; stop.ts)
+ *
+ * Order of random draws (for a seeded source): Nearby bucket, price inside the bucket,
+ * nudge, then the take-profit's jitter in front of a volume wall. Now draws only the
+ * take-profit jitter; Patient draws the nudge and the jitter (plus the two Nearby draws
+ * when it falls back to Nearby). Draw draws one nudge per entry leg.
  */
-import { pickEntry, type EntryDecision, type EntryOptions } from "./entry";
+import { pickEntry, type EntryDecision, type EntryDiagnostics, type EntryOptions } from "./entry";
 import { splitDraw } from "./drawSplit";
 import { splitFees, type FeeSplit } from "./fees";
 import { liquidationDistance } from "./liquidation";
 import { nudgePrice } from "./nudge";
 import { floorToStep, roundToTick } from "./rounding";
-import { pickTakeProfit, type TpSource } from "./takeProfit";
+import { planStop, resolveMaintenanceRate, type MaintenanceSource } from "./stop";
+import { pickTakeProfit, type TpSource, type TpZoneDiagnostics, type TpZoneOptions, type VolumeZone } from "./takeProfit";
 import { TicketTooSmallError } from "./drawSplit";
-import type { RandomSource, SetInput, SymbolRules, TraderLevels } from "./types";
+import type { Level, LeverageBracket, OrderBookDepth, RandomSource, SetInput, SymbolRules, TraderLevels } from "./types";
 
 /** One entry order. price is null for a market order. Units: quote per base; qty base. */
 export interface PlannedEntry {
@@ -25,11 +37,13 @@ export interface PlannedEntry {
   qty: number;
 }
 
-/** One reduce-only take-profit order (TAKE_PROFIT_MARKET triggered at stopPrice). */
-export interface PlannedTakeProfit {
+/** One reduce-only trigger order (TAKE_PROFIT_MARKET or STOP_MARKET) at stopPrice. */
+export interface PlannedTrigger {
   stopPrice: number;
   qty: number;
 }
+/** Kept for callers of the older name. */
+export type PlannedTakeProfit = PlannedTrigger;
 
 /** The whole plan of one Set. */
 export interface SetPlan {
@@ -50,24 +64,46 @@ export interface SetPlan {
     /** Expected average fill. For market, the current price (real fill may differ by slippage). */
     expectedFillPrice: number;
   };
-  orders: { entries: PlannedEntry[]; takeProfits: PlannedTakeProfit[] };
+  /** Same index = same leg: entries[i] opens, takeProfits[i] and stops[i] close it. */
+  orders: { entries: PlannedEntry[]; takeProfits: PlannedTrigger[]; stops: PlannedTrigger[] };
   /** Total base quantity across entries. */
   quantity: number;
+  /** Estimated liquidation price (at the average entry for Draw). */
   liquidationPrice: number;
+  stop: {
+    /** Stop trigger price (Draw: quantity-weighted average of the legs' stops). */
+    price: number;
+    /** 0.85: share of the liquidation distance. */
+    fractionOfLiquidation: number;
+    /** Maintenance margin rate used for the liquidation estimate (decimal) and its source. */
+    maintenanceMarginRate: number;
+    maintenanceSource: MaintenanceSource;
+  };
   takeProfit: {
     /** Quantity-weighted average take-profit price (single price unless Draw). */
     price: number;
-    /** Reward-to-risk ratio achieved (the smallest one in Draw). */
+    /** Reward-to-risk ratio vs the STOP distance (the smallest one in Draw). */
     ratio: number;
     source: TpSource | "drawn";
+    /** The volume wall the target sits in front of, when source is "volume-zone". */
+    zone: VolumeZone | null;
   };
   expected: {
     /** Profit if every take-profit fills, before exchange fees. USD. */
     profitAtTpUsd: number;
-    /** Loss if liquidated (about the ticket). USD, negative. */
+    /** Loss if the stop fires, before exchange fees: the real maximum loss. USD, negative. */
+    lossAtStopUsd: number;
+    /** Loss if the position were liquidated instead (about the ticket), for comparison. USD, negative. */
     lossAtLiquidationUsd: number;
     /** How the profit would be split on a win. */
     feeSplitOnWin: FeeSplit;
+  };
+  /** Structural counts for the log and the smoke run. */
+  diagnostics: {
+    entry: EntryDiagnostics;
+    takeProfitZone: TpZoneDiagnostics | null;
+    /** Opposite-side levels offered to the zone search, by source. */
+    oppositeVolumeLevels: { venueBook: number; traders: number };
   };
 }
 
@@ -76,7 +112,11 @@ export interface PlanOptions {
   entry?: Partial<EntryOptions>;
   nudgeFraction?: number;
   tpTolerance?: number;
-  maintenanceMarginRate?: number;
+  tpZone?: Partial<TpZoneOptions>;
+  /** Overrides the assumed maintenance rate when no brackets are passed (decimal). */
+  assumedMaintenanceRate?: number;
+  /** Share of the liquidation distance for the stop. Default 0.85. */
+  stopFraction?: number;
 }
 
 /**
@@ -90,12 +130,16 @@ export function buildSetPlan(args: {
   rules: SymbolRules;
   levels: TraderLevels;
   random: RandomSource;
+  /** Aster order book (public /fapi/v3/depth). Optional: without it only traders' orders feed the zone. */
+  depth?: OrderBookDepth | null;
+  /** Aster leverage brackets (signed /fapi/v3/leverageBrackets). Optional: without them a rate is assumed. */
+  brackets?: LeverageBracket[] | null;
   options?: PlanOptions;
 }): SetPlan {
   const { input, currentPrice, rules, levels } = args;
   const o = args.options ?? {};
   const notionalUsd = input.ticketUsd * input.leverage; // position size
-  const mmr = o.maintenanceMarginRate ?? 0;
+  const mm = resolveMaintenanceRate({ notionalUsd, leverage: input.leverage, brackets: args.brackets, assumedRate: o.assumedMaintenanceRate });
 
   if (input.entryMode === "draw") {
     if (!input.draw) throw new RangeError("draw mode needs the In and Out bands");
@@ -107,10 +151,12 @@ export function buildSetPlan(args: {
       rules,
       random: args.random,
       nudgeFraction: o.nudgeFraction,
-      maintenanceMarginRate: mmr,
+      maintenanceMarginRate: mm.rate,
+      maintenanceSource: mm.source,
     });
     const tpQty = d.takeProfits.reduce((s, t) => s + t.qty, 0);
     const avgTp = d.takeProfits.reduce((s, t) => s + t.price * t.qty, 0) / tpQty; // qty-weighted
+    const avgStop = d.stops.reduce((s, t) => s + t.price * t.qty, 0) / tpQty; // qty-weighted, for display
     const sign = input.side === "buy" ? 1 : -1;
     // Each TP closes its paired entry: profit = sum of qty x (tp - entry) in the trade's direction.
     const profit = d.takeProfits.reduce((s, t, i) => s + sign * (t.price - (d.entries[i]?.price ?? t.price)) * t.qty, 0);
@@ -130,20 +176,31 @@ export function buildSetPlan(args: {
       orders: {
         entries: d.entries.map((e) => ({ type: "LIMIT", price: e.price, qty: e.qty })),
         takeProfits: d.takeProfits.map((t) => ({ stopPrice: t.price, qty: t.qty })),
+        stops: d.stops.map((t) => ({ stopPrice: t.price, qty: t.qty })),
       },
       quantity: d.totalQty,
       liquidationPrice: d.liquidationPrice,
-      takeProfit: { price: avgTp, ratio: d.minRatio, source: "drawn" },
+      stop: { price: avgStop, fractionOfLiquidation: o.stopFraction ?? 0.85, maintenanceMarginRate: mm.rate, maintenanceSource: mm.source },
+      takeProfit: { price: avgTp, ratio: d.minRatio, source: "drawn", zone: null },
       expected: {
         profitAtTpUsd: round2(profit),
+        lossAtStopUsd: -round2(d.lossAtStopsUsd),
         lossAtLiquidationUsd: -round2(d.totalQty * liquidationDistance(d.averageEntry, d.liquidationPrice)),
         feeSplitOnWin: splitFees(round2(profit)),
       },
+      diagnostics: { entry: {}, takeProfitZone: null, oppositeVolumeLevels: { venueBook: 0, traders: 0 } },
     };
   }
 
   // Now / Nearby / Patient
-  const decision: EntryDecision = pickEntry({ mode: input.entryMode, side: input.side, currentPrice, levels, options: o.entry });
+  const decision: EntryDecision = pickEntry({
+    mode: input.entryMode,
+    side: input.side,
+    currentPrice,
+    levels,
+    random: args.random,
+    options: o.entry,
+  });
   let fill = currentPrice;
   let nudged: number | null = null;
   if (decision.orderType === "limit") {
@@ -163,15 +220,33 @@ export function buildSetPlan(args: {
     throw new TicketTooSmallError(notionalUsd, Math.max(rules.minNotionalUsd, minQty * fill));
   }
 
-  const tp = pickTakeProfit({
+  // Downside first: liquidation estimate, then the stop at 85% of that distance.
+  const stop = planStop({
     entry: fill,
     side: input.side,
     leverage: input.leverage,
+    tickSize: rules.tickSize,
+    maintenanceMarginRate: mm.rate,
+    maintenanceSource: mm.source,
+    fraction: o.stopFraction,
+  });
+
+  // Opposite-side resting volume for the take-profit zone: sellers above a Buy, buyers below a Sell.
+  const venueBook: Level[] = (input.side === "buy" ? args.depth?.asks : args.depth?.bids) ?? [];
+  const traderSide = input.side === "buy" ? "sell" : "buy";
+  const traderOrders: Level[] = levels.limitLevels.filter((l) => l.side === traderSide).map((l) => ({ price: l.price, weightUsd: l.weightUsd }));
+
+  const tp = pickTakeProfit({
+    entry: fill,
+    side: input.side,
+    stopPrice: stop.stopPrice,
     mode: input.tpMode,
     tickSize: rules.tickSize,
+    oppositeVolume: [...venueBook, ...traderOrders],
     traderTakeProfits: levels.takeProfitLevels,
+    random: args.random,
     tolerance: o.tpTolerance,
-    maintenanceMarginRate: mmr,
+    zone: o.tpZone,
   });
   const profit = round2(qty * Math.abs(tp.price - fill)); // TP is always on the profit side
   return {
@@ -190,14 +265,27 @@ export function buildSetPlan(args: {
     orders: {
       entries: [{ type: isMarket ? "MARKET" : "LIMIT", price: nudged, qty }],
       takeProfits: [{ stopPrice: tp.price, qty }],
+      stops: [{ stopPrice: stop.stopPrice, qty }],
     },
     quantity: qty,
-    liquidationPrice: tp.liquidationPrice,
-    takeProfit: { price: tp.price, ratio: tp.ratio, source: tp.source },
+    liquidationPrice: stop.liquidationPrice,
+    stop: {
+      price: stop.stopPrice,
+      fractionOfLiquidation: stop.fractionOfLiquidation,
+      maintenanceMarginRate: stop.maintenanceMarginRate,
+      maintenanceSource: stop.maintenanceSource,
+    },
+    takeProfit: { price: tp.price, ratio: tp.ratio, source: tp.source, zone: tp.zone },
     expected: {
       profitAtTpUsd: profit,
-      lossAtLiquidationUsd: -round2(qty * liquidationDistance(fill, tp.liquidationPrice)),
+      lossAtStopUsd: -round2(qty * stop.riskDistance),
+      lossAtLiquidationUsd: -round2(qty * liquidationDistance(fill, stop.liquidationPrice)),
       feeSplitOnWin: splitFees(profit),
+    },
+    diagnostics: {
+      entry: decision.diagnostics,
+      takeProfitZone: tp.diagnostics,
+      oppositeVolumeLevels: { venueBook: venueBook.length, traders: traderOrders.length },
     },
   };
 }

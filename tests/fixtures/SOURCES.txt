@@ -3,3 +3,4 @@ hl-leaderboard.json          GET https://stats-data.hyperliquid.xyz/Mainnet/lead
 hl-clearinghouseState.json   POST https://api.hyperliquid.xyz/info {"type":"clearinghouseState","user":"0x5b5d51203a0f9079f8aeb098a6523a13f298c060"} (assetPositions trimmed to BTC and ETH)
 hl-frontendOpenOrders.json   POST https://api.hyperliquid.xyz/info {"type":"frontendOpenOrders","user":"0xfc27136e42af1732ddc9ce2605ea9bff1b959d9d"} (4 BTC orders and 1 ZEC order)
 aster-exchangeInfo.json      GET https://fapi.asterdex.com/fapi/v3/exchangeInfo (symbols trimmed to BTCUSDT and ETHUSDT)
+aster-depth-BTCUSDT.json     GET https://fapi.asterdex.com/fapi/v3/depth?symbol=BTCUSDT&limit=1000 (captured 2026-11-16, not trimmed: 1,000 bids and 1,000 asks, mid about 64,426.1)
