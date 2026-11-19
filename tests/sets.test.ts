@@ -32,6 +32,7 @@ import {
   type SetLedger,
 } from "../src/core/ledger";
 import { setStopPrice, stopFromTicketLoss } from "../src/core/stop";
+import { checkNewSetRisk, parseAccountRisk } from "../src/core/risk";
 import { buildSetPlan, withSymbolLeverage, type SetPlan } from "../src/core/plan";
 import { seededRandom, type SymbolRules } from "../src/core/types";
 import { AsterClient, parseOrderTradeUpdate, privateKeySigner } from "../src/exchange/aster";
@@ -107,6 +108,22 @@ function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?
             marginType: "isolated",
           })),
         );
+      case "GET /fapi/v3/account":
+        return json({
+          availableBalance: String(state.available),
+          totalPositionInitialMargin: String(Math.max(0, state.wallet - state.available)),
+          totalOpenOrderInitialMargin: "0",
+          totalMaintMargin: String(state.rows.reduce((a, r) => a + Math.abs(r.positionAmt) * 64000 * 0.004, 0)),
+          positions: state.rows.map((r) => ({
+            symbol: "BTCUSDT",
+            positionSide: r.positionSide,
+            positionAmt: String(r.positionAmt),
+            entryPrice: String(r.entryPrice ?? 0),
+            notional: String(r.positionAmt * 64000),
+            maintMargin: String(Math.abs(r.positionAmt) * 64000 * 0.004),
+            isolated: false,
+          })),
+        });
       case "GET /fapi/v3/balance":
         return json([{ asset: "USDT", balance: String(state.wallet), availableBalance: String(state.available) }]);
       case "POST /fapi/v3/leverage":
@@ -465,11 +482,84 @@ describe("Refusals before anything is sent (HYBRID, negative)", () => {
     expect(checkMarginForSet({ ledger, ticketUsd: 10, availableBalanceUsd: 12, walletBalanceUsd: 20 })).toEqual({ ok: true });
   });
 
-  it("a position on the coin that the Sets do not explain (the user's own trade) refuses the Set", async () => {
-    const fake = fakeAster({ dual: false, leverage: 20, rows: [{ positionSide: "BOTH", positionAmt: 0.01, entryPrice: 64000, liquidationPrice: 60000 }] });
-    const r = await executeLive(fake.client, nowPlan("buy", 30), BTC, { store: memoryLedgerStore(), setId: "set_foreign" });
-    expect(r.ok === false && r.refused && r.message).toMatch(/does not match your open Sets/);
+  it("a large Set that pulls the liquidation more than 30% closer is refused, nothing sent", async () => {
+    // Own long 0.05 BTC; free balance $400 carries a $100 ticket, but the cushion is thin.
+    const fake = fakeAster({ dual: false, leverage: 30, rows: [{ positionSide: "BOTH", positionAmt: 0.05, entryPrice: 64000, liquidationPrice: 60000 }], wallet: 520, available: 400 });
+    const plan = buildSetPlan({ input: { symbol: "BTCUSDT", side: "buy", ticketUsd: 100, leverage: 100, tpMode: "deserved", entryMode: "now" }, currentPrice: 64000, rules: BTC, levels: NO_LEVELS, random: () => 0.5 });
+    const r = await executeLive(fake.client, plan, BTC, { store: memoryLedgerStore(), setId: "set_big" });
+    expect(r.ok === false && r.refused && r.message).toMatch(/closer to the price \(the limit is 30%\)/);
     expect(fake.of("POST", "/fapi/v3/placeStrategyOrder")).toHaveLength(0);
+  });
+});
+
+describe("A Set next to the user's own trade on the same coin (2026-11-19)", () => {
+  it("is placed with a warning; his position becomes the outside baseline; the entry leg carries the root trigger ids Aster requires (HYBRID)", async () => {
+    const fake = fakeAster({ dual: false, leverage: 30, rows: [{ positionSide: "BOTH", positionAmt: 0.067, entryPrice: 63530, liquidationPrice: 59286 }], wallet: 300, available: 170 });
+    const store = memoryLedgerStore();
+    const r = await executeLive(fake.client, nowPlan("buy", 30), BTC, { store, setId: "set_next" });
+    expect(r.ok).toBe(true);
+    expect(r.ok && r.warnings.join(" ")).toMatch(/already hold a BTC long of 0.067. This Set merges into it/);
+    expect(store.current().outside).toEqual({ BTCUSDT: { BOTH: 0.067 } });
+    const { legs } = legsOf(fake, 0);
+    expect(legs[0]).toMatchObject({ strategySubId: "1", firstDrivenId: "0", secondDrivenId: "0" });
+  });
+
+  it("reconcile: cutting his own part moves the baseline and keeps the Sets; closing everything cancels the Sets (negative)", () => {
+    let ledger = emptyLedger();
+    ledger.outside = { BTCUSDT: { BOTH: 0.067 } };
+    const set = createSetRecord({ id: "set_r1", symbol: "BTCUSDT", side: "buy", leverage: 30, ticketUsd: 10, positionMode: "one-way", now: 0, legs: [{ entryType: "MARKET", qty: 0.004, price: null, takeProfitPrice: 67000, stopPrice: 62000 }] });
+    ledger.sets.push(set);
+    ledger = applyOrderUpdate(ledger, ev("set_r1-1E", "FILLED", 0.004, 64000), 1).ledger;
+    const args = { symbol: "BTCUSDT", mode: "one-way" as const, stepSize: 0.001, graceMs: 0 };
+    const cut = reconcile(ledger, { ...args, positions: [{ positionSide: "BOTH", positionAmt: 0.034 }], now: 10 });
+    expect(cut.actions).toHaveLength(0);
+    expect(cut.ledger.outside?.BTCUSDT?.BOTH).toBeCloseTo(0.03, 9);
+    expect(cut.ledger.sets[0]!.status).toBe("open");
+    const gone = reconcile(cut.ledger, { ...args, positions: [{ positionSide: "BOTH", positionAmt: 0 }], now: 20 });
+    expect(gone.ledger.sets[0]!.status).toBe("closed-outside");
+    expect(gone.actions.map((a) => (a.kind === "cancel" ? a.role : a.kind)).sort()).toEqual(["stop", "takeProfit"]);
+  });
+});
+
+describe("Liquidation and stop rules before a Set (REAL)", () => {
+  // Shota's account, read live 2026-11-19 11:30 UTC (GET /fapi/v3/account).
+  const live = parseAccountRisk({
+    availableBalance: "167.35580547",
+    totalPositionInitialMargin: "152.65678708",
+    totalOpenOrderInitialMargin: "0",
+    totalMaintMargin: "13.87299485",
+    positions: [
+      { symbol: "ETHUSDT", maintMargin: "0.75007515", positionSide: "BOTH", positionAmt: "0.166", notional: "300.03006000", entryPrice: "1805.73", isolated: false },
+      { symbol: "BTCUSDT", maintMargin: "13.12291970", positionSide: "BOTH", positionAmt: "0.067", notional: "4279.67263659", entryPrice: "63530.07761194", isolated: false },
+    ],
+  });
+  const mark = 4279.67263659 / 0.067;
+  const newBtc = (qty: number, side: "buy" | "sell", stopPrice: number) => ({ symbol: "BTCUSDT", side, qty, price: mark, stopPrice, maintenanceMarginRate: 0.003, positionMode: "one-way" as const });
+
+  it("the model reproduces Aster's BTC liquidation (59,286) within 0.05%", () => {
+    const v = checkNewSetRisk(live, newBtc(0.004, "buy", mark * 0.97), []);
+    const btc = v.rows.find((r) => r.symbol === "BTCUSDT")!;
+    expect(Math.abs((btc.liqBefore as number) - 59286.1) / 59286.1).toBeLessThan(0.0005);
+  });
+
+  it("$10 and $30 at 30x pass; $100 at 30x (43% closer) is refused; a stop past 85% of the way to the new liquidation is refused (negative)", () => {
+    expect(checkNewSetRisk(live, newBtc(0.004, "buy", mark * (1 - 0.85 / 30)), []).ok).toBe(true);
+    const mid = checkNewSetRisk(live, newBtc(0.014, "buy", mark * (1 - 0.85 / 30)), []);
+    expect(mid.ok).toBe(true);
+    expect(mid.warnings.join(" ")).toMatch(/liquidation moves 18% closer/);
+    const big = checkNewSetRisk(live, newBtc(0.046, "buy", mark * (1 - 0.85 / 30)), []);
+    expect(big.ok).toBe(false);
+    expect(big.reasons[0]).toMatch(/43% closer to the price/);
+    // An open Set's stop at 59,700 sits past 85% of the way from 64,000 to the new liquidation (about 59,565).
+    const stops = checkNewSetRisk(live, newBtc(0.004, "buy", mark * (1 - 0.85 / 30)), [{ setId: "set_old", side: "buy", entryPrice: 64000, stopPrice: 59700 }]);
+    expect(stops.ok).toBe(false);
+    expect(stops.reasons[0]).toMatch(/Set set_old's stop at 59700\.0 would sit 9\d% of the way/);
+  });
+
+  it("margin uses account equity: a multi-asset account with a small USDT wallet is not refused; a broken account answer fails loudly (negative)", () => {
+    expect(live.equityUsd).toBeCloseTo(320.01, 1);
+    expect(checkMarginForSet({ ledger: emptyLedger(), ticketUsd: 10, availableBalanceUsd: live.availableBalanceUsd, walletBalanceUsd: live.equityUsd })).toEqual({ ok: true });
+    expect(() => parseAccountRisk({ availableBalance: "1" })).toThrow(/totalPositionInitialMargin missing/);
   });
 });
 

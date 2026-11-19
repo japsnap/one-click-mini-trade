@@ -208,6 +208,13 @@ export interface SetLedger {
   sets: SetRecord[];
   /** Key: `${symbol}:${BOTH|LONG|SHORT}`. */
   suspects: Record<string, SuspectedMismatch>;
+  /**
+   * The user's own position outside the Sets, per symbol and key (BOTH, LONG, SHORT; hedge
+   * SHORT positive), recorded when the first Set opens on a coin that already holds a
+   * position (2026-11-19, Shota: allow a Set next to his own trade, with a warning). The
+   * exchange should then show outside + Sets. Optional: ledgers saved before it read as none.
+   */
+  outside?: Record<string, Record<string, number>>;
 }
 
 export function emptyLedger(): SetLedger {
@@ -532,6 +539,13 @@ export interface ExchangePosition {
  * one-way: { BOTH: Buy Sets minus Sell Sets }   hedge: { LONG: Buy Sets, SHORT: Sell Sets (positive) }
  */
 export function expectedPositions(ledger: SetLedger, symbol: string, mode: PositionMode): Record<string, number> {
+  const sets = setPositions(ledger, symbol, mode);
+  const out = ledger.outside?.[symbol] ?? {};
+  return Object.fromEntries(Object.entries(sets).map(([k, v]) => [k, clean(v + (out[k] ?? 0))]));
+}
+
+/** The Sets' own share of the position (without the user's outside position). */
+export function setPositions(ledger: SetLedger, symbol: string, mode: PositionMode): Record<string, number> {
   const sets = activeSets(ledger, symbol);
   if (mode === "one-way") {
     return { BOTH: clean(sets.reduce((s, x) => s + (x.side === "buy" ? 1 : -1) * setOpenQty(x), 0)) };
@@ -540,6 +554,22 @@ export function expectedPositions(ledger: SetLedger, symbol: string, mode: Posit
     LONG: clean(sets.filter((x) => x.side === "buy").reduce((s, x) => s + setOpenQty(x), 0)),
     SHORT: clean(sets.filter((x) => x.side === "sell").reduce((s, x) => s + setOpenQty(x), 0)),
   };
+}
+
+/**
+ * Record the user's own position on a coin as the outside baseline. Only when no Set is
+ * active on that coin (otherwise the exchange position mixes Sets and outside). Returns
+ * the new ledger and the recorded baseline (zero keys dropped).
+ */
+export function recordOutside(ledger0: SetLedger, symbol: string, mode: PositionMode, rows: ExchangePosition[]): { ledger: SetLedger; outside: Record<string, number> } {
+  const ledger = structuredClone(ledger0);
+  if (activeSets(ledger, symbol).length > 0) return { ledger, outside: ledger.outside?.[symbol] ?? {} };
+  const act = actualPositions(rows, mode);
+  const outside = Object.fromEntries(Object.entries(act).filter(([, v]) => v !== 0));
+  ledger.outside = { ...(ledger.outside ?? {}) };
+  if (Object.keys(outside).length > 0) ledger.outside[symbol] = outside;
+  else delete ledger.outside[symbol];
+  return { ledger, outside };
 }
 
 /** What the exchange DOES show, in the same keys (hedge SHORT as a positive number). */
@@ -599,6 +629,17 @@ export function reconcile(
       continue;
     }
     delete ledger.suspects[sk];
+    // The Sets' part is still all there and only the user's own part changed (he cut or
+    // added to his own trade in the app): move the outside baseline, keep the Sets.
+    const setsPart = setPositions(ledger, args.symbol, args.mode)[d.key] ?? 0;
+    const covered = setsPart !== 0 && Math.sign(d.actual) === Math.sign(setsPart) && Math.abs(d.actual) >= Math.abs(setsPart) - args.stepSize / 2;
+    if (covered) {
+      const rest = clean(d.actual - setsPart);
+      ledger.outside = { ...(ledger.outside ?? {}), [args.symbol]: { ...(ledger.outside?.[args.symbol] ?? {}), [d.key]: rest } };
+      if (rest === 0) delete (ledger.outside[args.symbol] as Record<string, number>)[d.key];
+      log.push({ level: "warn", message: `${sk}: your own position changed outside the Sets (now ${rest}); the Sets' ${setsPart} is intact and keeps its exits` });
+      continue;
+    }
     confirmed.push(d);
     const affected = activeSets(ledger, args.symbol).filter(
       (s) => filledQty({ fills: s.legs.flatMap((l) => l.entry.fills) }) > 0 && (d.key === "BOTH" || (d.key === "LONG") === (s.side === "buy")),

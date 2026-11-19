@@ -32,7 +32,8 @@ import { seededRandom, type LeverageBracket, type OrderBookDepth, type RandomSou
 import { AsterClient, privateKeySigner } from "../src/exchange/aster";
 import { HyperliquidLevelSource, coinFromSymbol, type LevelsReport } from "../src/levels/hyperliquid";
 import { ConfigError, describeConfig, loadConfig } from "./config";
-import { describeLedger, executeLive, planToSetLegs, type LedgerStore } from "./execute";
+import { describeLedger, executeLive, planToSetLegs, preTradeCheck, type LedgerStore } from "./execute";
+import { parsePositionRows } from "../src/exchange/aster";
 import { emptyLedger, newSetId, type SetLedger } from "../src/core/ledger";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -265,8 +266,17 @@ const server = createServer(async (req, res) => {
       const { plan, sources } = await planFromBody(await readJson(req), true);
       const rules = await aster.getSymbolRules(plan.input.symbol);
       await logPlan("preview", plan);
+      // With keys set, run the same read-only checks a live Set must pass, so the card can
+      // show the warnings (own position on the coin, liquidation moving closer) before the tap.
+      let check: unknown = null;
+      if (cfg.credentials) {
+        const hedge = await aster.isHedgeMode();
+        const rows = parsePositionRows(await aster.positionRisk(plan.input.symbol), plan.input.symbol);
+        const c = await preTradeCheck(aster, plan, rules, { ledger: await ledgerStore.load(), mode: hedge ? "hedge" : "one-way", rows });
+        check = c.ok ? { ok: true, warnings: c.risk.warnings } : { ok: false, message: c.message, warnings: c.risk?.warnings ?? [] };
+      }
       // Show the exact legs that would be signed (one-way mode assumed for the preview).
-      return send(res, 200, { plan, sources, asterOrders: planToSetLegs(plan, rules, false) });
+      return send(res, 200, { plan, sources, check, asterOrders: planToSetLegs(plan, rules, false) });
     }
     if (req.method === "POST" && url.pathname === "/api/set/place") {
       const { plan, sources } = await planFromBody(await readJson(req), false);

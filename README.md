@@ -85,11 +85,20 @@ What Blackboard's backend runs: `executeLive` on Enter, `handleOrderUpdate` for 
 - **Leverage rules differ by country.** Several countries cap retail leverage on crypto derivatives or ban them outright; check where each user lives before offering 30x to 100x.
 - **Levels are a guide, not a promise.** A level that mattered on Hyperliquid may not hold on Aster.
 
+## A Set next to the user's own trade (2026-11-19)
+
+- The user's own position on a coin is recorded as the outside baseline when the first Set opens there; the card warns that the Set merges into it. The exchange must then show outside + Sets.
+- If he cuts or adds to his own part and the Sets' part is still covered, the baseline moves and the Sets keep their exits. If the position no longer covers the Sets (he closed everything), the Sets are closed outside and their orders cancelled.
+- Refused before sending (`src/core/risk.ts`): free balance below the ticket; account equity below every open ticket plus this one (equity from `GET /fapi/v3/account`, because Blackboard accounts use multi-asset margin and the USDT wallet alone is small); any position's liquidation moving more than 30% closer to the price; any stop on the coin sitting past 85% of the way to the new liquidation. A move of 10 to 30% is a warning.
+- Isolated margin does not separate Sets: Aster isolates per coin (per side in hedge mode), so two Sets on one coin and side still share one position. Sets read the margin type and never change it.
+- `npx tsx scripts/check-account.ts` reads the account (no order); `POST /api/set/preview` returns the same checks as `check` when keys are set.
+
 ## Open items
 
 - Aster's V3 doc lists `builder` and `feeRate` only on the strategy order endpoint, which is what live Sets use. Adding them to a plain `POST /fapi/v3/order` is done because Blackboard's guide asks for it, but that table does not list them, and the doc says unlisted parameters are rejected. The first live $10 Set will show which holds.
-- The doc's two signing examples differ: one signs `nonce` and `signer`, the other `nonce`, `user` and `signer`. This client signs all three (the doc's authentication table). If Aster answers a signature error, set `includeUserInSignedString: false`.
+- Signing with `nonce`, `user` and `signer` works: proven live 2026-11-19.
 - Patient needs liquidation prices near the price. With the wider set (171 traders on 2026-11-16) a Sell found a short cluster 4.15% above the price, but a Buy found no long liquidations within 5% below (8 longs below the price, none inside the window), so a Patient Buy fell back to Nearby. Hyperliquid's public liquidation feed would add more.
-- Live OTOCO wiring is our reading of the doc. The V3 doc lists OTOCO and the `secondDrivenId` / `secondDrivenOn` / `secondTrigger` fields but prints no OTOCO example. The first live $10 Set will show whether Aster accepts the three legs as built in `server/execute.ts`.
-- Many Sets at once rests on parts of the V3 doc that show no example: that a strategy sub-order's `clientOrderId` is kept and echoed in the order event (the ledger also matches by `orderId`, learned from `GET /fapi/v3/strategyOpenOrder`), that `POST /fapi/v3/updateStrategyOrder` can resize exits that are already working, and that cancelling one sub-order by `origClientOrderId` works. The first live $10 Set, followed by a second Set on the same coin, will show it.
+- OTOCO works live (2026-11-19, one $10 ETH Set at 30x): entry filled 0.166 at 1,805.73, take-profit 1,900.12 and stop 1,758.19 placed by Aster, and every order event carried our client order ids (`set_...-1E`, `-1T`, `-1S`) plus `si` (strategyId) and `ss` (sub id). Aster's gateway needs `firstDrivenId: "0"` and `secondDrivenId: "0"` on the entry leg, although the doc marks them optional (two refusals with code -1102 before that, nothing sent).
+- Still unproven: `POST /fapi/v3/updateStrategyOrder` resizing working exits, and cancelling one sub-order by `origClientOrderId`. Both need a partial fill or a second Set on the same coin.
+- The user data stream closed itself a few minutes after opening (`scripts/listen-stream.ts`); Blackboard's backend needs a reconnect loop.
 - Before the fill, trial mode has no leverage brackets (a signed call), so it assumes a 0.5% maintenance margin rate. Live mode reads the real brackets; after the fill, `reconcileStop()` uses Aster's own liquidation price.

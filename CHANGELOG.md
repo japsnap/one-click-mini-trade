@@ -1,5 +1,14 @@
 # Changelog
 
+
+## 2026-11-19: first live Set; Sets next to the user's own trade
+
+- First live $10 ETH Set at 30x: OTOCO accepted after adding root trigger ids to the entry leg; fill, take-profit, stop and order events with Set ids all confirmed.
+- New pre-trade check (`src/core/risk.ts`, `preTradeCheck` in `server/execute.ts`): own position on the coin allowed with a warning (outside baseline in the ledger), refused when a liquidation moves more than 30% closer or a stop leaves the 85% rule; margin uses account equity (multi-asset margin).
+- Reconcile keeps the Sets when only the user's own part changed.
+- Scripts: `scripts/check-account.ts` (read-only), `scripts/listen-stream.ts` (user data stream to `logs/stream.jsonl`).
+- Tests: 124 pass.
+
 ## 2026-11-16 (many Sets at once)
 - A Set ledger (`src/core/ledger.ts`) so many Sets per account work together: a Buy and a Sell Set on one coin, several Sets on one coin and side, Sets at different leverages. Every order carries a client order id `<setId>-<leg><E|T|S>`; each Set's own filled quantity, price and fees are recorded from Aster's order events.
 - Decision: the account's position mode and margin type are read, never changed (they belong to Blackboard's app). Live Sets no longer switch the coin to isolated margin. One-way mode: exits are plain opposite-side orders of the Set's quantity, not reduce-only, so the net position equals the sum of open Sets. Hedge mode: positionSide LONG / SHORT per Set direction.

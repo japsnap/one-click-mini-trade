@@ -43,10 +43,12 @@ import type { SetPlan } from "../src/core/plan";
 import { withSymbolLeverage } from "../src/core/plan";
 import type { SymbolRules } from "../src/core/types";
 import { DEFAULT_ASSUMED_MAINTENANCE_RATE } from "../src/core/stop";
+import { checkNewSetRisk, parseAccountRisk, type RiskVerdict } from "../src/core/risk";
 import { formatToStep, isOnStep } from "../src/core/rounding";
 import {
   activeSets,
   applyOrderUpdate,
+  averagePrice,
   checkMarginForSet,
   comparePositions,
   createSetRecord,
@@ -54,6 +56,7 @@ import {
   emptyLedger,
   legOpenQty,
   newSetId,
+  recordOutside,
   reconcile,
   setClientOrderId,
   setPnl,
@@ -123,6 +126,12 @@ export function planToSetLegs(plan: SetPlan, rules: SymbolRules, hedgeMode: bool
 
     const entry: StrategySubOrder = {
       strategySubId: "1",
+      // Aster's gateway refuses an OTOCO whose first leg lacks firstDrivenId or
+      // secondDrivenId (code -1102, live 2026-11-19), although the doc lists both as
+      // optional; "0" means "driven by nothing", the value its own query answer shows
+      // for a root sub-order.
+      firstDrivenId: "0",
+      secondDrivenId: "0",
       securityType: "USDT_FUTURES",
       symbol: rules.symbol,
       side: openSide,
@@ -216,8 +225,8 @@ export function withLedgerLock<T>(store: LedgerStore, fn: () => Promise<T>): Pro
 // ---------------------------------------------------------------------------
 
 export type PlaceResult =
-  | { ok: true; setId: string; legs: SetLegs[]; sent: unknown[]; leverage: { target: number; changed: boolean; reason: string }; log: LedgerLog[] }
-  | { ok: false; refused: true; message: string; log: LedgerLog[] }
+  | { ok: true; setId: string; legs: SetLegs[]; sent: unknown[]; leverage: { target: number; changed: boolean; reason: string }; warnings: string[]; risk: RiskVerdict; log: LedgerLog[] }
+  | { ok: false; refused: true; message: string; risk?: RiskVerdict; log: LedgerLog[] }
   | { ok: false; refused: false; setId: string; sent: unknown[]; failedAt: number; error: string; legs: SetLegs[]; log: LedgerLog[] };
 
 /**
@@ -248,23 +257,10 @@ export async function executeLive(
     const rows = parsePositionRows(await client.positionRisk(symbol), symbol);
     let ledger = await opts.store.load();
 
-    const otherMode = activeSets(ledger, symbol).find((s) => s.positionMode !== mode);
-    if (otherMode) {
-      return { ok: false, refused: true, message: `Your Aster account is now in ${mode} mode, but open Sets on ${symbol} were placed in ${otherMode.positionMode} mode. Close those Sets first.`, log };
-    }
-    const mismatch = comparePositions(ledger, symbol, mode, rows, rules.stepSize);
-    if (mismatch.length > 0) {
-      const d = mismatch[0]!;
-      return {
-        ok: false,
-        refused: true,
-        message: `Your ${symbol} position on Aster (${d.actual}) does not match your open Sets (${d.expected}). A trade outside the Sets is open on this coin, or a fill is still settling. Close that trade in the app or try again in a few seconds.`,
-        log,
-      };
-    }
-    const bal = parseUsdtBalance(await client.balance());
-    const margin = checkMarginForSet({ ledger, ticketUsd: plan.input.ticketUsd, ...bal });
-    if (!margin.ok) return { ok: false, refused: true, message: margin.message, log };
+    const check = await preTradeCheck(client, plan, rules, { ledger, mode, rows });
+    if (!check.ok) return { ok: false, refused: true, message: check.message, ...(check.risk ? { risk: check.risk } : {}), log };
+    ledger = check.ledger;
+    const risk = check.risk;
 
     const lev = symbolLeverageTarget({ ledger, symbol, newLeverage: plan.input.leverage, currentLeverage: symbolLeverageFromRows(rows) });
     if (lev.change) await client.changeLeverage(symbol, lev.target);
@@ -314,8 +310,62 @@ export async function executeLive(
       ledger = replaceSet(ledger, record);
       await opts.store.save(ledger);
     }
-    return { ok: true, setId, legs, sent, leverage: { target: lev.target, changed: lev.change, reason: lev.reason }, log };
+    return { ok: true, setId, legs, sent, leverage: { target: lev.target, changed: lev.change, reason: lev.reason }, warnings: risk.warnings, risk, log };
   });
+}
+
+/**
+ * Every check a new Set must pass before anything is sent (read-only: it only reads the
+ * account). Used by executeLive and by the live preview, so the card can show the same
+ * warnings before the tap.
+ *  1. Open Sets on the coin were placed under the account's current position mode.
+ *  2. With no active Set on the coin, the user's own position there becomes the outside
+ *     baseline (warned about, not refused). With active Sets, the position must equal
+ *     outside + Sets.
+ *  3. Margin: free balance carries the ticket; account equity carries every open ticket
+ *     plus this one (checkMarginForSet). Equity comes from the account endpoint because
+ *     Blackboard accounts run multi-asset margin, where the USDT wallet alone is small.
+ *  4. Liquidation and stops (core/risk.ts): refused when any position's liquidation moves
+ *     more than 30% closer, or a stop on the coin would sit past 85% of the way to the
+ *     new liquidation.
+ */
+export async function preTradeCheck(
+  client: AsterClient,
+  plan: SetPlan,
+  rules: SymbolRules,
+  ctx: { ledger: SetLedger; mode: PositionMode; rows: PositionRow[] },
+): Promise<{ ok: true; ledger: SetLedger; risk: RiskVerdict } | { ok: false; message: string; risk?: RiskVerdict }> {
+  const symbol = rules.symbol;
+  const otherMode = activeSets(ctx.ledger, symbol).find((s) => s.positionMode !== ctx.mode);
+  if (otherMode) {
+    return { ok: false, message: `Your Aster account is now in ${ctx.mode} mode, but open Sets on ${symbol} were placed in ${otherMode.positionMode} mode. Close those Sets first.` };
+  }
+  const { ledger } = recordOutside(ctx.ledger, symbol, ctx.mode, ctx.rows);
+  const mismatch = comparePositions(ledger, symbol, ctx.mode, ctx.rows, rules.stepSize);
+  if (mismatch.length > 0) {
+    const d = mismatch[0]!;
+    return {
+      ok: false,
+      message: `Your ${symbol} position on Aster (${d.actual}) does not match your open Sets plus your own trade (${d.expected}). A fill is still settling, or the position changed in the app. Try again in a few seconds.`,
+    };
+  }
+  const account = parseAccountRisk(await client.account());
+  const margin = checkMarginForSet({ ledger, ticketUsd: plan.input.ticketUsd, availableBalanceUsd: account.availableBalanceUsd, walletBalanceUsd: account.equityUsd });
+  if (!margin.ok) return { ok: false, message: margin.message };
+  const qty = plan.orders.entries.reduce((s, e) => s + e.qty, 0);
+  const price = plan.orders.entries.reduce((s, e) => s + e.qty * (e.price ?? plan.entry.expectedFillPrice), 0) / qty;
+  const openStops = activeSets(ledger, symbol).flatMap((set) =>
+    set.legs
+      .filter((l) => l.entry.fills.length > 0)
+      .map((l) => ({ setId: set.id, side: set.side, entryPrice: averagePrice(l.entry), stopPrice: l.stop.stopPrice })),
+  );
+  const risk = checkNewSetRisk(
+    account,
+    { symbol, side: plan.input.side, qty, price, stopPrice: plan.stop.price, maintenanceMarginRate: plan.stop.maintenanceMarginRate ?? DEFAULT_ASSUMED_MAINTENANCE_RATE, positionMode: ctx.mode },
+    openStops,
+  );
+  if (!risk.ok) return { ok: false, message: risk.reasons.join(" "), risk };
+  return { ok: true, ledger, risk };
 }
 
 function replaceSet(ledger: SetLedger, set: SetRecord): SetLedger {

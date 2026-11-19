@@ -688,6 +688,11 @@ export class AsterClient {
     return this.signed("GET", "/fapi/v3/balance", []);
   }
 
+  /** GET /fapi/v3/account (Account Information v3): cushion and maintenance for the pre-trade risk check (core/risk.ts parseAccountRisk). */
+  account() {
+    return this.signed("GET", "/fapi/v3/account", []);
+  }
+
   /** GET /fapi/v3/openOrders for one symbol. */
   openOrders(symbol: string) {
     return this.signed("GET", "/fapi/v3/openOrders", [["symbol", symbol]]);
