@@ -11,13 +11,15 @@
  *   leg 3  stop, STOP_MARKET, placed once leg 1 is (partly) filled; cancelled if leg 2 fills
  * Both exits trigger on the MARK price (Aster liquidates on the mark price too).
  *
- * MANY SETS AT ONCE (2026-11-16; the design is in src/core/ledger.ts):
+ * MANY SETS, ONE PER COIN (2026-11-16, never-merge ruling 2026-11-20; design in src/core/ledger.ts):
+ *  - A new Set is refused when its coin already holds any position or a live Set
+ *    (preTradeCheck), so a Set's position never merges with another.
  *  - Every order carries a client order id `<setId>-<leg><E|T|S>`; each OTOCO carries
  *    `<setId>-<leg>`. The ledger records each Set's own fills.
  *  - The account's position mode and margin type are READ, never changed (Blackboard's
  *    own app owns them). One-way mode: exits are plain opposite-side orders of the Set's
- *    quantity, NOT reduce-only, so the net position always equals the sum of open Sets.
- *    Hedge mode: positionSide LONG / SHORT per Set direction (reduceOnly is not allowed).
+ *    quantity; reduce-only only when the reduceOnlyExits option is on (default off, untested
+ *    live). Hedge mode: positionSide LONG / SHORT per Set direction (reduceOnly is not allowed).
  *  - Exits are sized to the Set's FILLED quantity: the OTOCO places them at the planned
  *    quantity on the first fill, and syncSetExits resizes them (updateStrategyOrder) after
  *    every fill event, and moves each stop to the Set's own stop (85% of its ticket,
@@ -35,28 +37,24 @@
  *                      (every 30 to 60 s for each symbol with open Sets)
  * All three run under one lock per ledger store, so two of them never interleave.
  *
- * The V3 doc lists OTOCO and the secondDrivenId / secondDrivenOn / secondTrigger fields
- * but prints no OTOCO example; the leg wiring below is our reading of those fields and
- * is unproven until the first live $10 Set (README "Open items").
+ * The leg wiring below was proven live on 2026-11-19 (one $10 ETH Set, README "Open items").
  */
 import type { SetPlan } from "../src/core/plan";
 import { withSymbolLeverage } from "../src/core/plan";
 import type { SymbolRules } from "../src/core/types";
-import { DEFAULT_ASSUMED_MAINTENANCE_RATE } from "../src/core/stop";
-import { checkNewSetRisk, parseAccountRisk, type RiskVerdict } from "../src/core/risk";
+import { activeRules } from "../src/rules/rules";
+import { checkCoinIsFree, checkNewSetRisk, parseAccountRisk, type RiskVerdict } from "../src/core/risk";
 import { formatToStep, isOnStep } from "../src/core/rounding";
 import {
   activeSets,
   applyOrderUpdate,
   averagePrice,
   checkMarginForSet,
-  comparePositions,
   createSetRecord,
   desiredExits,
   emptyLedger,
   legOpenQty,
   newSetId,
-  recordOutside,
   reconcile,
   setClientOrderId,
   setPnl,
@@ -94,8 +92,11 @@ export interface SetLegs {
  * Why separate from sending: the trial mode shows these legs, and tests check them.
  * hedgeMode: the account's position mode (read with isHedgeMode, never changed).
  * setId: when given, every leg carries its Set client order id (live Sets always pass one).
+ * opts.reduceOnlyExits: one-way mode only, marks both exits reduceOnly "true" (the V3 doc
+ * lists reduceOnly on strategy sub-orders; untested live, so off unless the server's
+ * ASTER_EXIT_REDUCE_ONLY is "true").
  */
-export function planToSetLegs(plan: SetPlan, rules: SymbolRules, hedgeMode: boolean, setId?: string): SetLegs[] {
+export function planToSetLegs(plan: SetPlan, rules: SymbolRules, hedgeMode: boolean, setId?: string, opts: { reduceOnlyExits?: boolean } = {}): SetLegs[] {
   const openSide: "BUY" | "SELL" = plan.input.side === "buy" ? "BUY" : "SELL";
   const closeSide: "BUY" | "SELL" = plan.input.side === "buy" ? "SELL" : "BUY";
   const positionSide: "LONG" | "SHORT" | undefined = hedgeMode ? (plan.input.side === "buy" ? "LONG" : "SHORT") : undefined;
@@ -142,9 +143,8 @@ export function planToSetLegs(plan: SetPlan, rules: SymbolRules, hedgeMode: bool
       ...(ids ? { clientOrderId: ids.e } : {}),
     };
     // Shared fields of the two exits.
-    //  one-way: NO reduceOnly (decision 2 in src/core/ledger.ts). A reduce-only exit of a Buy
-    //           Set would be refused whenever a Sell Set had moved the net short; a plain
-    //           opposite order of the Set's own quantity keeps net = sum of open Sets.
+    //  one-way: plain opposite orders of the Set's quantity (decision 2 in src/core/ledger.ts);
+    //           reduce-only when switched on, so a hand-closed position cannot be reopened by an exit.
     //  hedge:   positionSide closes the Set's side (reduceOnly is not allowed there).
     const exitBase = {
       securityType: "USDT_FUTURES" as const,
@@ -152,6 +152,7 @@ export function planToSetLegs(plan: SetPlan, rules: SymbolRules, hedgeMode: bool
       side: closeSide,
       workingType: "MARK_PRICE" as const,
       ...(positionSide ? { positionSide } : {}),
+      ...(!positionSide && opts.reduceOnlyExits ? { reduceOnly: "true" as const } : {}),
       // Placed by leg 1 as soon as the entry is partly or fully filled; resized to the
       // filled quantity by syncSetExits.
       firstDrivenId: "1",
@@ -232,12 +233,11 @@ export type PlaceResult =
 /**
  * Send a plan live as a new Set.
  *  1. Read the position mode (never change it) and the symbol's position rows.
- *  2. Refuse when the exchange position on the symbol does not equal the open Sets (a
- *     trade made outside the Sets, or a fill still settling), or when open Sets were
- *     placed under another position mode: mixing would break every Set's exits.
- *  3. Refuse when the balance cannot carry the ticket (checkMarginForSet).
- *  4. Raise the symbol leverage to the highest open Set's (never lower while Sets are open)
- *     and pull this Set's stops in to that leverage's liquidation (withSymbolLeverage).
+ *  2. Refuse when the coin already holds any position or a live Set (never merge), when
+ *     the balance cannot carry the ticket, or when the cross-margin cushion rules fail
+ *     (preTradeCheck).
+ *  3. Set the symbol leverage to this Set's (symbolLeverageTarget; with no other Set on the
+ *     coin it simply follows the Set) and pull the stops in if it stands higher (withSymbolLeverage).
  *  5. Save the Set record, then send one OTOCO per leg, saving after each.
  * Stops at the first send failure and reports what was already sent; nothing is retried
  * blindly (after an unknown answer the order may exist: its fills are still matched by id).
@@ -246,7 +246,7 @@ export async function executeLive(
   client: AsterClient,
   plan: SetPlan,
   rules: SymbolRules,
-  opts: { store: LedgerStore; now?: () => number; random?: () => number; setId?: string },
+  opts: { store: LedgerStore; now?: () => number; random?: () => number; setId?: string; reduceOnlyExits?: boolean },
 ): Promise<PlaceResult> {
   return withLedgerLock(opts.store, async () => {
     const now = opts.now ?? Date.now;
@@ -268,7 +268,7 @@ export async function executeLive(
     const placed = withSymbolLeverage(plan, rules, lev.target);
 
     const setId = opts.setId ?? newSetId(now(), opts.random ?? Math.random);
-    const legs = planToSetLegs(placed, rules, hedge, setId);
+    const legs = planToSetLegs(placed, rules, hedge, setId, { reduceOnlyExits: opts.reduceOnlyExits });
     const record = createSetRecord({
       id: setId,
       symbol,
@@ -317,17 +317,15 @@ export async function executeLive(
 /**
  * Every check a new Set must pass before anything is sent (read-only: it only reads the
  * account). Used by executeLive and by the live preview, so the card can show the same
- * warnings before the tap.
- *  1. Open Sets on the coin were placed under the account's current position mode.
- *  2. With no active Set on the coin, the user's own position there becomes the outside
- *     baseline (warned about, not refused). With active Sets, the position must equal
- *     outside + Sets.
- *  3. Margin: free balance carries the ticket; account equity carries every open ticket
+ * refusal or warnings before the tap.
+ *  1. Never merge (owner's ruling 2026-11-20): the coin holds no position on any side (the
+ *     user's own or a Set's) and no live Set in the ledger (core/risk.ts checkCoinIsFree).
+ *  2. Margin: free balance carries the ticket; account equity carries every open ticket
  *     plus this one (checkMarginForSet). Equity comes from the account endpoint because
  *     Blackboard accounts run multi-asset margin, where the USDT wallet alone is small.
- *  4. Liquidation and stops (core/risk.ts): refused when any position's liquidation moves
- *     more than 30% closer, or a stop on the coin would sit past 85% of the way to the
- *     new liquidation.
+ *  3. Liquidation and stops (core/risk.ts): refused when any other coin's liquidation moves
+ *     more than the "risk.liquidationShrinkBlock" rule closer (cross margin links coins), or
+ *     the new Set's stop would sit past the stop rule's share of the way to its liquidation.
  */
 export async function preTradeCheck(
   client: AsterClient,
@@ -336,33 +334,18 @@ export async function preTradeCheck(
   ctx: { ledger: SetLedger; mode: PositionMode; rows: PositionRow[] },
 ): Promise<{ ok: true; ledger: SetLedger; risk: RiskVerdict } | { ok: false; message: string; risk?: RiskVerdict }> {
   const symbol = rules.symbol;
-  const otherMode = activeSets(ctx.ledger, symbol).find((s) => s.positionMode !== ctx.mode);
-  if (otherMode) {
-    return { ok: false, message: `Your Aster account is now in ${ctx.mode} mode, but open Sets on ${symbol} were placed in ${otherMode.positionMode} mode. Close those Sets first.` };
-  }
-  const { ledger } = recordOutside(ctx.ledger, symbol, ctx.mode, ctx.rows);
-  const mismatch = comparePositions(ledger, symbol, ctx.mode, ctx.rows, rules.stepSize);
-  if (mismatch.length > 0) {
-    const d = mismatch[0]!;
-    return {
-      ok: false,
-      message: `Your ${symbol} position on Aster (${d.actual}) does not match your open Sets plus your own trade (${d.expected}). A fill is still settling, or the position changed in the app. Try again in a few seconds.`,
-    };
-  }
+  const ledger = ctx.ledger;
+  const free = checkCoinIsFree({ symbol, positionAmts: ctx.rows.map((r) => r.positionAmt), liveSetIds: activeSets(ledger, symbol).map((s) => s.id) });
+  if (!free.ok) return { ok: false, message: free.message };
   const account = parseAccountRisk(await client.account());
   const margin = checkMarginForSet({ ledger, ticketUsd: plan.input.ticketUsd, availableBalanceUsd: account.availableBalanceUsd, walletBalanceUsd: account.equityUsd });
   if (!margin.ok) return { ok: false, message: margin.message };
   const qty = plan.orders.entries.reduce((s, e) => s + e.qty, 0);
   const price = plan.orders.entries.reduce((s, e) => s + e.qty * (e.price ?? plan.entry.expectedFillPrice), 0) / qty;
-  const openStops = activeSets(ledger, symbol).flatMap((set) =>
-    set.legs
-      .filter((l) => l.entry.fills.length > 0)
-      .map((l) => ({ setId: set.id, side: set.side, entryPrice: averagePrice(l.entry), stopPrice: l.stop.stopPrice })),
-  );
   const risk = checkNewSetRisk(
     account,
-    { symbol, side: plan.input.side, qty, price, stopPrice: plan.stop.price, maintenanceMarginRate: plan.stop.maintenanceMarginRate ?? DEFAULT_ASSUMED_MAINTENANCE_RATE, positionMode: ctx.mode },
-    openStops,
+    { symbol, side: plan.input.side, qty, price, stopPrice: plan.stop.price, maintenanceMarginRate: plan.stop.maintenanceMarginRate ?? activeRules().risk.assumedMaintenanceRate, positionMode: ctx.mode },
+    [],
   );
   if (!risk.ok) return { ok: false, message: risk.reasons.join(" "), risk };
   return { ok: true, ledger, risk };
@@ -440,8 +423,8 @@ export async function reconcileSymbol(
   });
 }
 
-/** Cancel orders by our client id. "Unknown order" (-2011, -2013) means already gone: logged, not an error. */
-async function performCancels(client: AsterClient, ledger0: SetLedger, actions: LedgerAction[], log: LedgerLog[]): Promise<SetLedger> {
+/** Cancel orders by our client id. "Unknown order" (-2011, -2013) means already gone: logged, not an error. A failed cancel flags the Set. */
+export async function performCancels(client: AsterClient, ledger0: SetLedger, actions: LedgerAction[], log: LedgerLog[]): Promise<SetLedger> {
   const ledger = structuredClone(ledger0);
   for (const a of actions) {
     if (a.kind !== "cancel") continue;
@@ -509,7 +492,7 @@ export async function syncSetExits(
   if (open.length === 0) return ledger;
   const rows = opts.rows ?? parsePositionRows(await client.positionRisk(rules.symbol), rules.symbol);
   const symbolLeverage = symbolLeverageFromRows(rows);
-  const mmr = opts.maintenanceMarginRate ?? DEFAULT_ASSUMED_MAINTENANCE_RATE;
+  const mmr = opts.maintenanceMarginRate ?? activeRules().risk.assumedMaintenanceRate;
   let updates = 0;
   for (const set of open) {
     const cap = stopCapFor(set, rows, { symbolLeverage, maintenanceMarginRate: mmr });

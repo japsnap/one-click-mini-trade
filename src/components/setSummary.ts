@@ -1,7 +1,7 @@
 /**
- * Words and numbers for the card's one tappable summary row (owner rule 2026-11-16):
- * the take-profit mode and the entry mode, then target price, win amount and max loss,
- * so the row shows what the choice is worth and invites a tap to change it.
+ * Words and numbers for the card's one tappable options line (owner rule 2026-11-20): it
+ * shows what the options hold, from the current plan, not the option names, for example
+ * "30x · target +5.2% ($15.6) · stop -2.6% ($7.9) · entry at market".
  *
  * Pure functions, no React: the card, a Blackboard screen or a test can all call them.
  * Wording is a first draft for the branding manager to review; the numbers are the plan's.
@@ -22,7 +22,36 @@ export function px(v: number | null | undefined): string {
   return v == null ? "market" : v.toLocaleString("en-US", { maximumFractionDigits: 2 });
 }
 
-/** The summary row's two lines. Without a plan yet, the second line is null. */
+/** "$15.6"; under $1 two decimals ("$0.43"). Units: USD, sign dropped. */
+function money1(v: number): string {
+  const a = Math.abs(v);
+  return `$${a < 1 ? a.toFixed(2) : a.toFixed(1)}`;
+}
+
+/**
+ * The options line. Without a plan yet only the leverage is known: "30x · ...".
+ * Target and stop are measured from the expected entry; the dollars are the plan's win at
+ * the take-profit and loss at the stop.
+ */
+export function optionsLine(leverage: number, plan: SetPlan | null | undefined): string {
+  if (!plan) return `${leverage}x · ...`;
+  const entry = plan.entry.expectedFillPrice;
+  const pct = (p: number) => `${((Math.abs(p - entry) / entry) * 100).toFixed(1)}%`;
+  const where =
+    plan.entry.usedMode === "now"
+      ? "entry at market"
+      : plan.orders.entries.length > 1
+        ? `entry across ${plan.orders.entries.length} orders`
+        : `entry at ${px(entry)}`;
+  return [
+    `${plan.input.leverage}x`,
+    `target +${pct(plan.takeProfit.price)} (${money1(plan.expected.profitAtTpUsd)})`,
+    `stop -${pct(plan.stop.price)} (${money1(plan.expected.lossAtStopUsd)})`,
+    where,
+  ].join(" · ");
+}
+
+/** The older summary row (mode names, then target, win and max loss), kept for other screens. */
 export function summaryLines(tpMode: TpMode, entryMode: EntryMode, plan: SetPlan | null | undefined): { title: string; detail: string | null } {
   const title = `${TP_LABEL[tpMode]} · ${WHEN_LABEL[entryMode]}`;
   if (!plan) return { title, detail: null };

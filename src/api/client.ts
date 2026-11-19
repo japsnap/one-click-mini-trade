@@ -1,11 +1,12 @@
 /**
- * The card's data layer: the four calls it needs, as one interface.
+ * The card's data layer: the calls it needs, as one interface.
  *
  * Blackboard replaces `demoServerApi` with its own implementation (its backend, signing
  * through Privy or its agent key); the card itself does not change. Nothing here holds a key.
  */
 import type { SetPlan } from "../core/plan";
 import type { SetInput } from "../core/types";
+import type { SetRules } from "../rules/rules";
 
 /** Answer of a preview. asterOrders is the exact legs the server would sign (opaque to the card). */
 export interface PreviewResponse {
@@ -29,6 +30,8 @@ export interface SetCardApi {
   preview(input: SetInput): Promise<PreviewResponse>;
   /** Place the Set (or run it as a trial). */
   place(input: SetInput): Promise<PlaceResponse>;
+  /** The active rule set (ticket and leverage choices, defaults). Optional: without it the card uses the default rules. */
+  getRules?(): Promise<SetRules>;
 }
 
 /** POST/GET JSON and surface the server's error text (never a silent empty result). */
@@ -50,5 +53,8 @@ export const demoServerApi: SetCardApi = {
   },
   place(input) {
     return call<PlaceResponse>("/api/set/place", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+  },
+  async getRules() {
+    return (await call<{ rules: SetRules }>("/api/rules")).rules;
   },
 };

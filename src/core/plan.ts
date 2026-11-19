@@ -30,6 +30,7 @@ import { floorToStep, roundToTick } from "./rounding";
 import { planStop, resolveMaintenanceRate, type MaintenanceSource } from "./stop";
 import { pickTakeProfit, type TpSource, type TpZoneDiagnostics, type TpZoneOptions, type VolumeZone } from "./takeProfit";
 import { TicketTooSmallError } from "./drawSplit";
+import { activeRules } from "../rules/rules";
 import type { Level, LeverageBracket, OrderBookDepth, RandomSource, SetInput, SymbolRules, TraderLevels } from "./types";
 
 /** One entry order. price is null for a market order. Units: quote per base; qty base. */
@@ -182,7 +183,7 @@ export function buildSetPlan(args: {
       },
       quantity: d.totalQty,
       liquidationPrice: d.liquidationPrice,
-      stop: { price: avgStop, fractionOfLiquidation: o.stopFraction ?? 0.85, maintenanceMarginRate: mm.rate, maintenanceSource: mm.source },
+      stop: { price: avgStop, fractionOfLiquidation: o.stopFraction ?? activeRules().stop.fractionOfLiquidation, maintenanceMarginRate: mm.rate, maintenanceSource: mm.source },
       takeProfit: { price: avgTp, ratio: d.minRatio, source: "drawn", zone: null },
       expected: {
         profitAtTpUsd: round2(profit),

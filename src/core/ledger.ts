@@ -1,14 +1,15 @@
 /**
- * The Set ledger: many open Sets per account, on the same coin, on both sides and at
- * different leverages, without breaking each other (rules of 2026-11-16).
+ * The Set ledger: every Set of one account, its orders, fills and status (rules of
+ * 2026-11-16; one Set per coin since 2026-11-20).
  *
  * THE PROBLEM IT SOLVES
  * Aster keeps one position per symbol (one-way mode) or one per symbol and side (hedge
- * mode). It does not know what a "Set" is. Two Buy Sets on BTC merge into one long; a Buy
- * and a Sell Set in one-way mode net against each other; leverage is one number per
- * symbol; the liquidation price and realizedPnl belong to the merged position. So the
- * truth about each Set has to live HERE, in a ledger the app keeps, and the exchange is
- * only checked against it.
+ * mode). It does not know what a "Set" is: two trades on one coin merge into one position
+ * with one liquidation price. Since the owner's never-merge ruling (2026-11-20) a new Set
+ * is refused when its coin already holds any position or a live Set (core/risk.ts
+ * checkCoinIsFree), so each Set owns its coin's position. The ledger still keeps the
+ * truth about each Set here, and still reads ledgers saved before the ruling (several
+ * Sets on one coin, and the user's own position recorded as `outside`).
  *
  * DECISIONS (also in CHANGELOG.md, 2026-11-16 "Many Sets at once")
  *  1. Every Set has an id ("set_" + time + random). Every order it sends carries a client
@@ -17,18 +18,17 @@
  *     (falling back to Aster's orderId), so the Set's OWN filled quantity and price are known.
  *  2. The account's position mode and margin type are NEVER changed (that would change
  *     Blackboard's own app for the user). The mode is read and stored per Set.
- *       one-way: exits are plain opposite-side orders of the Set's quantity, NOT reduce-only.
- *                Then the exchange's net position always equals the sum of open Sets
- *                (+ for Buy Sets, - for Sell Sets). A reduce-only exit would be refused or
- *                shrunk whenever another Set had moved the net to the other side.
+ *       one-way: exits are opposite-side orders of the Set's quantity, so the exchange's net
+ *                position equals the Set's own. reduceOnly "true" is optional (server
+ *                config ASTER_EXIT_REDUCE_ONLY, default off until tried live).
  *       hedge:   positionSide LONG for Buy Sets, SHORT for Sell Sets; exits close that
  *                side by quantity. (Aster forbids reduceOnly in hedge mode.)
  *  3. Each Set's take-profit and stop are sized to that Set's FILLED quantity and its stop
  *     comes from the Set's own numbers (core/stop.ts setStopPrice: 85% of the ticket,
  *     capped at 85% of the real liquidation distance of the account's position).
- *  4. Leverage: the Set's leverage is its sizing (notional = ticket x leverage). The symbol
- *     leverage is raised to the highest leverage among open Sets on that symbol and never
- *     lowered while Sets are open there (symbolLeverageTarget).
+ *  4. Leverage: the Set's leverage is its sizing (notional = ticket x leverage). With one Set
+ *     per coin the symbol leverage follows the Set (symbolLeverageTarget; for an old ledger
+ *     with several Sets on a coin it is never lowered while they are open).
  *  5. Margin: a Set is refused when the free balance cannot carry its ticket, or the wallet
  *     cannot carry every open ticket plus this one (checkMarginForSet).
  *  6. Reconcile: the exchange's position per symbol and side must equal the sum of open
@@ -40,7 +40,8 @@
  *     least `graceMs` apart (default 5 s), before anything is cancelled. Why: the position
  *     moves on the exchange a moment before the fill event reaches the ledger; acting on
  *     the first sight would cancel every Set's exits on every ordinary fill. graceMs: 0
- *     acts at once.
+ *     acts at once. The watcher (server/watch.ts) applies the narrower rule of 2026-11-20:
+ *     only a position that no longer COVERS a Set's filled quantity closes it (uncoveredSets).
  *  7. When one Set's exit fills, only THAT Set's sibling exit is cancelled (and its
  *     unfilled entry remainder, so it cannot reopen a position with no exits). The OTOCO
  *     already cancels the sibling on the exchange; our cancel is the backstop.
@@ -210,9 +211,9 @@ export interface SetLedger {
   suspects: Record<string, SuspectedMismatch>;
   /**
    * The user's own position outside the Sets, per symbol and key (BOTH, LONG, SHORT; hedge
-   * SHORT positive), recorded when the first Set opens on a coin that already holds a
-   * position (2026-11-19, Shota: allow a Set next to his own trade, with a warning). The
-   * exchange should then show outside + Sets. Optional: ledgers saved before it read as none.
+   * SHORT positive). Written only between 2026-11-19 and 2026-11-20, when a Set could open
+   * next to his own trade; new Sets never write it (never-merge ruling). Still read, so an
+   * old ledger reconciles as before. Optional: ledgers without it read as none.
    */
   outside?: Record<string, Record<string, number>>;
 }
@@ -340,6 +341,12 @@ export interface OrderUpdate {
   /** Aster trade id; used to ignore a fill delivered twice. */
   tradeId: string | null;
   time: number;
+  /**
+   * The order's total filled quantity after this event (stream "z", query "executedQty"),
+   * when known. With it a fill already counted under another id (a catch-up read, then the
+   * same trade from the stream) is never counted twice.
+   */
+  cumulativeFilledQty?: number;
 }
 
 /** Something the executor must do on the exchange. Never "place": the ledger only cancels or resizes. */
@@ -455,13 +462,16 @@ export function applyOrderUpdate(ledger0: SetLedger, u: OrderUpdate, now: number
   let filled = false;
   if (u.executionType === "TRADE" && u.lastFilledQty > 0) {
     const tradeId = u.tradeId ?? `${u.orderId ?? u.clientOrderId}:${u.time}:${u.lastFilledQty}:${u.lastFilledPrice}`;
-    if (order.fills.some((f) => f.tradeId === tradeId)) {
+    const already = filledQty(order);
+    const known = u.cumulativeFilledQty;
+    if (order.fills.some((f) => f.tradeId === tradeId) || (known !== undefined && already >= known - 1e-12)) {
       log.push({ level: "info", setId: set.id, message: `duplicate fill ${tradeId} on ${order.clientOrderId} ignored` });
       return { ledger: ledger0, actions: [], log, needsReconcile: false, matched: true };
     }
     order.fills.push({
       tradeId,
-      qty: u.lastFilledQty,
+      // With the cumulative known, record exactly what is missing (an event may have been lost).
+      qty: known !== undefined ? clean(known - already) : u.lastFilledQty,
       price: u.lastFilledPrice,
       commission: Math.abs(u.commission || 0),
       commissionAsset: u.commissionAsset,
@@ -556,22 +566,6 @@ export function setPositions(ledger: SetLedger, symbol: string, mode: PositionMo
   };
 }
 
-/**
- * Record the user's own position on a coin as the outside baseline. Only when no Set is
- * active on that coin (otherwise the exchange position mixes Sets and outside). Returns
- * the new ledger and the recorded baseline (zero keys dropped).
- */
-export function recordOutside(ledger0: SetLedger, symbol: string, mode: PositionMode, rows: ExchangePosition[]): { ledger: SetLedger; outside: Record<string, number> } {
-  const ledger = structuredClone(ledger0);
-  if (activeSets(ledger, symbol).length > 0) return { ledger, outside: ledger.outside?.[symbol] ?? {} };
-  const act = actualPositions(rows, mode);
-  const outside = Object.fromEntries(Object.entries(act).filter(([, v]) => v !== 0));
-  ledger.outside = { ...(ledger.outside ?? {}) };
-  if (Object.keys(outside).length > 0) ledger.outside[symbol] = outside;
-  else delete ledger.outside[symbol];
-  return { ledger, outside };
-}
-
 /** What the exchange DOES show, in the same keys (hedge SHORT as a positive number). */
 export function actualPositions(rows: ExchangePosition[], mode: PositionMode): Record<string, number> {
   if (mode === "one-way") return { BOTH: clean(rows.filter((r) => r.positionSide === "BOTH").reduce((s, r) => s + r.positionAmt, 0)) };
@@ -664,6 +658,68 @@ export function reconcile(
     }
   }
   return { ledger, actions, log, needsReconcile: false, matched: true, mismatches: confirmed };
+}
+
+/**
+ * The watcher's rule (server/watch.ts, 2026-11-20): the Sets on a symbol (and side, in
+ * hedge mode) whose filled quantity the exchange position no longer covers while one of
+ * their exits is still working. Typical cause: the user closed the position by hand in
+ * Blackboard's app, and the exits are left behind. Pure; acts on nothing.
+ * Covered = the position points the Sets' way and holds at least their open quantity
+ * (half a step of slack). A larger position (the user added by hand) still covers.
+ */
+export function uncoveredSets(
+  ledger: SetLedger,
+  symbol: string,
+  rows: ExchangePosition[],
+  stepSize: number,
+): Array<{ setId: string; key: string; setsQty: number; positionQty: number }> {
+  const out: Array<{ setId: string; key: string; setsQty: number; positionQty: number }> = [];
+  const sets = activeSets(ledger, symbol).filter((s) => setOpenQty(s) > 1e-12);
+  for (const mode of ["one-way", "hedge"] as const) {
+    const mine = sets.filter((s) => s.positionMode === mode);
+    if (mine.length === 0) continue;
+    const need = setPositions({ ...ledger, sets: mine }, symbol, mode);
+    const have = actualPositions(rows, mode);
+    for (const [key, setsQty] of Object.entries(need)) {
+      if (setsQty === 0) continue;
+      const positionQty = have[key] ?? 0;
+      const covered = Math.sign(positionQty) === Math.sign(setsQty) && Math.abs(positionQty) >= Math.abs(setsQty) - stepSize / 2;
+      if (covered) continue;
+      for (const s of mine) {
+        if (key !== "BOTH" && (key === "LONG") !== (s.side === "buy")) continue;
+        const exitsWorking = s.legs.some((l) => legOpenQty(l) > 1e-12 && [l.takeProfit, l.stop].some((o) => !isFinal(o) && !o.cancelRequested));
+        if (exitsWorking) out.push({ setId: s.id, key, setsQty, positionQty });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Mark Sets "closed-outside" and ask to cancel every order of theirs still working (both
+ * exits, and an unfilled entry remainder so it cannot reopen a position). Pure; places nothing.
+ */
+export function closeSetsOutside(ledger0: SetLedger, setIds: string[], now: number, reason = "closed outside the Set"): LedgerStep {
+  const ledger = structuredClone(ledger0);
+  const actions: LedgerAction[] = [];
+  const log: LedgerLog[] = [];
+  for (const set of ledger.sets.filter((s) => setIds.includes(s.id))) {
+    if (set.status === "closed-outside") continue;
+    set.status = "closed-outside";
+    set.closedAt = now;
+    set.closeReason = reason;
+    for (const leg of set.legs) {
+      for (const role of ["takeProfit", "stop", "entry"] as const) {
+        const o = leg[role];
+        if (isFinal(o) || o.cancelRequested) continue;
+        o.cancelRequested = true;
+        actions.push({ kind: "cancel", symbol: set.symbol, setId: set.id, legIndex: leg.index, role, clientOrderId: o.clientOrderId, orderId: o.orderId, reason });
+      }
+    }
+    log.push({ level: "error", setId: set.id, message: `Set ${set.id} (${set.side} ${setOpenQty(set)} ${set.symbol}) ${reason}` });
+  }
+  return { ledger, actions, log, needsReconcile: false, matched: true };
 }
 
 // ---------------------------------------------------------------------------

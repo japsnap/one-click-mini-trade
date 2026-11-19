@@ -1,6 +1,9 @@
 /**
- * Many Sets at once (2026-11-16): the Set ledger (src/core/ledger.ts), the per-Set stop
- * (src/core/stop.ts) and the executor (server/execute.ts).
+ * Sets on one account (2026-11-16; one Set per coin since the never-merge ruling of
+ * 2026-11-20): the Set ledger (src/core/ledger.ts), the per-Set stop (src/core/stop.ts),
+ * the pre-trade checks (src/core/risk.ts) and the executor (server/execute.ts). Tests that
+ * hold two Sets on one coin start from a ledger saved before the ruling, which the code
+ * must still read.
  *
  * Categories (rules/testing.md):
  *  - REAL: pure ledger, stop and parse functions; assertions on returned ledger state,
@@ -32,7 +35,7 @@ import {
   type SetLedger,
 } from "../src/core/ledger";
 import { setStopPrice, stopFromTicketLoss } from "../src/core/stop";
-import { checkNewSetRisk, parseAccountRisk } from "../src/core/risk";
+import { checkCoinIsFree, checkNewSetRisk, parseAccountRisk } from "../src/core/risk";
 import { buildSetPlan, withSymbolLeverage, type SetPlan } from "../src/core/plan";
 import { seededRandom, type SymbolRules } from "../src/core/types";
 import { AsterClient, parseOrderTradeUpdate, privateKeySigner } from "../src/exchange/aster";
@@ -82,8 +85,16 @@ interface Row {
  * decoded parameters. positionRisk answers state.rows (with the symbol leverage on each
  * row, as the doc shows); POST /fapi/v3/leverage changes state.leverage.
  */
-function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?: number; available?: number }) {
-  const state = { ...init, wallet: init.wallet ?? 1000, available: init.available ?? 1000 };
+/** A position on another coin, seen only in the account answer (cross margin links coins). */
+interface OtherCoin {
+  symbol: string;
+  positionAmt: number;
+  entryPrice: number;
+  markPrice: number;
+}
+
+function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?: number; available?: number; others?: OtherCoin[] }) {
+  const state = { ...init, wallet: init.wallet ?? 1000, available: init.available ?? 1000, others: init.others ?? [] };
   const calls: Array<{ method: string; path: string; params: URLSearchParams }> = [];
   let nextStrategy = 100;
   const json = (x: unknown, status = 200) => new Response(JSON.stringify(x), { status });
@@ -113,16 +124,29 @@ function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?
           availableBalance: String(state.available),
           totalPositionInitialMargin: String(Math.max(0, state.wallet - state.available)),
           totalOpenOrderInitialMargin: "0",
-          totalMaintMargin: String(state.rows.reduce((a, r) => a + Math.abs(r.positionAmt) * 64000 * 0.004, 0)),
-          positions: state.rows.map((r) => ({
-            symbol: "BTCUSDT",
-            positionSide: r.positionSide,
-            positionAmt: String(r.positionAmt),
-            entryPrice: String(r.entryPrice ?? 0),
-            notional: String(r.positionAmt * 64000),
-            maintMargin: String(Math.abs(r.positionAmt) * 64000 * 0.004),
-            isolated: false,
-          })),
+          totalMaintMargin: String(
+            state.rows.reduce((a, r) => a + Math.abs(r.positionAmt) * 64000 * 0.004, 0) + state.others.reduce((a, o) => a + Math.abs(o.positionAmt) * o.markPrice * 0.004, 0),
+          ),
+          positions: [
+            ...state.rows.map((r) => ({
+              symbol: "BTCUSDT",
+              positionSide: r.positionSide,
+              positionAmt: String(r.positionAmt),
+              entryPrice: String(r.entryPrice ?? 0),
+              notional: String(r.positionAmt * 64000),
+              maintMargin: String(Math.abs(r.positionAmt) * 64000 * 0.004),
+              isolated: false,
+            })),
+            ...state.others.map((o) => ({
+              symbol: o.symbol,
+              positionSide: "BOTH",
+              positionAmt: String(o.positionAmt),
+              entryPrice: String(o.entryPrice),
+              notional: String(o.positionAmt * o.markPrice),
+              maintMargin: String(Math.abs(o.positionAmt) * o.markPrice * 0.004),
+              isolated: false,
+            })),
+          ],
         });
       case "GET /fapi/v3/balance":
         return json([{ asset: "USDT", balance: String(state.wallet), availableBalance: String(state.available) }]);
@@ -171,8 +195,10 @@ describe("Set ids (REAL)", () => {
   });
 });
 
-describe("Buy and Sell Set on BTC at the same time", () => {
-  it("one-way mode: plain opposite exits, the net equals the sum of Sets, one Set's take-profit cancels only its own stop (HYBRID)", async () => {
+const NEVER = "A Set never shares a coin with another position, so nothing was sent.";
+
+describe("One Set per coin: a Set's position never merges (2026-11-20)", () => {
+  it("one-way mode: a second Set on the coin is refused while the first is live, before and after its fill; its take-profit cancels its stop; then the coin is free again (HYBRID)", async () => {
     const fake = fakeAster({ dual: false, leverage: 20, rows: [{ positionSide: "BOTH", positionAmt: 0 }] });
     const store = memoryLedgerStore();
     const buy = await executeLive(fake.client, nowPlan("buy", 30), BTC, { store, setId: "set_buy01" });
@@ -185,101 +211,73 @@ describe("Buy and Sell Set on BTC at the same time", () => {
       ["SELL", "STOP_MARKET", "set_buy01-1S"],
     ]);
     for (const l of b.legs) {
-      expect(l.reduceOnly).toBeUndefined(); // decision 2: never reduce-only in one-way mode
+      expect(l.reduceOnly).toBeUndefined(); // off unless ASTER_EXIT_REDUCE_ONLY is true
       expect(l.positionSide).toBeUndefined();
       expect(l.quantity).toBe("0.004"); // $10 x 30 / 64,000 = 0.00468 -> 0.004
     }
 
-    // Buy entry fills; the exchange now shows the long.
+    // Before the fill the position is still flat, but the live Set holds the coin.
+    const early = await executeLive(fake.client, nowPlan("sell", 30), BTC, { store, setId: "set_sel00" });
+    expect(early).toMatchObject({ ok: false, refused: true, message: `BTC already has a live Set (set_buy01). ${NEVER}` });
+
+    // Buy entry fills; the exchange now shows the long. A Sell Set would net against it: refused.
     fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0.004, entryPrice: 64000, liquidationPrice: 62200 }];
     await handleOrderUpdate(fake.client, ev("set_buy01-1E", "FILLED", 0.004, 64000), BTC, { store });
-
     const sell = await executeLive(fake.client, nowPlan("sell", 30, 64010), BTC, { store, setId: "set_sel01" });
-    expect(sell.ok).toBe(true);
-    const s = legsOf(fake, 1);
-    expect(s.legs.map((l) => [l.side, l.type])).toEqual([
-      ["SELL", "MARKET"],
-      ["BUY", "TAKE_PROFIT_MARKET"],
-      ["BUY", "STOP_MARKET"],
-    ]);
-    expect(s.legs.every((l) => l.reduceOnly === undefined)).toBe(true);
-    expect(fake.of("POST", "/fapi/v3/leverage").map((c) => c.params.get("leverage"))).toEqual(["30"]); // set once, kept for the Sell
+    expect(sell).toMatchObject({ ok: false, refused: true, message: `BTC already has an open position. ${NEVER}` });
+    expect(fake.of("POST", "/fapi/v3/placeStrategyOrder")).toHaveLength(1);
+    expect(store.current().sets.map((x) => x.id)).toEqual(["set_buy01"]); // refusals leave no record
 
-    // Sell entry fills: one-way nets to zero, and that is exactly the Sets' sum.
+    // The Buy Set's take-profit fills: its stop is cancelled and the Set is closed.
     fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0 }];
-    await handleOrderUpdate(fake.client, ev("set_sel01-1E", "FILLED", 0.004, 64010), BTC, { store });
-    const r1 = await reconcileSymbol(fake.client, BTC, { store, now: () => 10_000 });
-    expect(r1.mismatches).toEqual([]);
-    expect(r1.cancelled).toBe(0);
-
-    // The Buy Set's take-profit fills: only ITS stop is cancelled; the Sell Set keeps both exits.
-    fake.state.rows = [{ positionSide: "BOTH", positionAmt: -0.004, entryPrice: 64010, liquidationPrice: 65800 }];
-    const deletesBefore = fake.of("DELETE", "/fapi/v3/order").length;
     await handleOrderUpdate(fake.client, ev("set_buy01-1T", "FILLED", 0.004, 66000), BTC, { store });
-    const cancels = fake.of("DELETE", "/fapi/v3/order").slice(deletesBefore).map((c) => c.params.get("origClientOrderId"));
-    expect(cancels).toEqual(["set_buy01-1S"]);
-    const l = store.current();
-    expect(l.sets.find((x) => x.id === "set_buy01")!.status).toBe("closed");
-    const sellSet = l.sets.find((x) => x.id === "set_sel01")!;
-    expect(sellSet.status).toBe("open");
-    expect(sellSet.legs[0]!.takeProfit.qty).toBe(0.004);
-    expect(sellSet.legs[0]!.stop.qty).toBe(0.004);
+    expect(fake.of("DELETE", "/fapi/v3/order").map((c) => c.params.get("origClientOrderId"))).toEqual(["set_buy01-1S"]);
+    expect(store.current().sets[0]!.status).toBe("closed");
     expect((await reconcileSymbol(fake.client, BTC, { store, now: () => 20_000 })).mismatches).toEqual([]);
+
+    // Flat and no live Set: the next Set on BTC goes out.
+    expect((await executeLive(fake.client, nowPlan("sell", 30), BTC, { store, setId: "set_sel02" })).ok).toBe(true);
     expect(fake.of("POST", "/fapi/v3/order")).toHaveLength(0); // never a plain order placed
   });
 
-  it("hedge mode: LONG and SHORT legs, no reduceOnly; a hand-close of the short only closes the Sell Set (HYBRID)", async () => {
+  it("hedge mode: a Sell Set is refused while a Buy Set is live, even with the SHORT side flat; the Buy Set's legs are LONG with no reduceOnly (HYBRID, negative)", async () => {
     const fake = fakeAster({ dual: true, leverage: 30, rows: [{ positionSide: "LONG", positionAmt: 0 }, { positionSide: "SHORT", positionAmt: 0 }] });
     const store = memoryLedgerStore();
     expect((await executeLive(fake.client, nowPlan("buy", 30), BTC, { store, setId: "set_hbuy1" })).ok).toBe(true);
-    expect((await executeLive(fake.client, nowPlan("sell", 30), BTC, { store, setId: "set_hsel1" })).ok).toBe(true);
     expect(legsOf(fake, 0).legs.map((l) => l.positionSide)).toEqual(["LONG", "LONG", "LONG"]);
-    expect(legsOf(fake, 1).legs.map((l) => l.positionSide)).toEqual(["SHORT", "SHORT", "SHORT"]);
-    for (const n of [0, 1]) expect(legsOf(fake, n).legs.every((l) => l.reduceOnly === undefined)).toBe(true);
+    expect(legsOf(fake, 0).legs.every((l) => l.reduceOnly === undefined)).toBe(true);
     expect(fake.of("POST", "/fapi/v3/leverage")).toHaveLength(0); // the symbol already stood at 30x
-
-    fake.state.rows = [
-      { positionSide: "LONG", positionAmt: 0.004, entryPrice: 64000, liquidationPrice: 62200 },
-      { positionSide: "SHORT", positionAmt: -0.004, entryPrice: 64000, liquidationPrice: 65800 },
-    ];
-    await handleOrderUpdate(fake.client, ev("set_hbuy1-1E", "FILLED", 0.004, 64000), BTC, { store });
-    await handleOrderUpdate(fake.client, ev("set_hsel1-1E", "FILLED", 0.004, 64000), BTC, { store });
-    expect((await reconcileSymbol(fake.client, BTC, { store, now: () => 1_000 })).mismatches).toEqual([]);
-
-    // The user closes the short by hand in Blackboard's app.
-    fake.state.rows = [{ positionSide: "LONG", positionAmt: 0.004, entryPrice: 64000, liquidationPrice: 62200 }, { positionSide: "SHORT", positionAmt: 0 }];
-    await reconcileSymbol(fake.client, BTC, { store, now: () => 2_000 });
-    const r = await reconcileSymbol(fake.client, BTC, { store, now: () => 8_000 });
-    expect(r.mismatches).toEqual([{ key: "SHORT", expected: 0.004, actual: 0 }]);
-    expect(fake.of("DELETE", "/fapi/v3/order").map((c) => c.params.get("origClientOrderId")).sort()).toEqual(["set_hsel1-1S", "set_hsel1-1T"]);
-    const l = store.current();
-    expect(l.sets.find((x) => x.id === "set_hsel1")!.status).toBe("closed-outside");
-    expect(l.sets.find((x) => x.id === "set_hbuy1")!.status).toBe("open");
+    const r = await executeLive(fake.client, nowPlan("sell", 30), BTC, { store, setId: "set_hsel1" });
+    expect(r).toMatchObject({ ok: false, refused: true, message: `BTC already has a live Set (set_hbuy1). ${NEVER}` });
+    // A position on either side blocks the coin too.
+    const other = fakeAster({ dual: true, leverage: 30, rows: [{ positionSide: "LONG", positionAmt: 0 }, { positionSide: "SHORT", positionAmt: -0.01 }] });
+    const r2 = await executeLive(other.client, nowPlan("buy", 30), BTC, { store: memoryLedgerStore(), setId: "set_hbuy2" });
+    expect(r2).toMatchObject({ ok: false, refused: true, message: `BTC already has an open position. ${NEVER}` });
+    expect(other.of("POST", "/fapi/v3/placeStrategyOrder")).toHaveLength(0);
   });
 });
 
-describe("Two Buy Sets at 30x and 50x on BTC", () => {
-  it("leverage is raised to 50, never lowered while Sets are open, and a later 30x Set's stop sits in front of the 50x liquidation (HYBRID)", async () => {
+describe("Leverage with one Set per coin", () => {
+  it("the symbol leverage follows each new Set: 30, then 50 after the first Set closed (HYBRID)", async () => {
     const fake = fakeAster({ dual: false, leverage: 20, rows: [{ positionSide: "BOTH", positionAmt: 0 }] });
     const store = memoryLedgerStore();
     await executeLive(fake.client, nowPlan("buy", 30), BTC, { store, setId: "set_l30a" });
     fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0.004, entryPrice: 64000, liquidationPrice: 62200 }];
     await handleOrderUpdate(fake.client, ev("set_l30a-1E", "FILLED", 0.004, 64000), BTC, { store });
-    await executeLive(fake.client, nowPlan("buy", 50), BTC, { store, setId: "set_l50a" });
-    fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0.011, entryPrice: 64000, liquidationPrice: 62900 }];
-    await handleOrderUpdate(fake.client, ev("set_l50a-1E", "FILLED", 0.007, 64000), BTC, { store });
-    const third = nowPlan("buy", 30);
-    await executeLive(fake.client, third, BTC, { store, setId: "set_l30b" });
+    fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0 }];
+    await handleOrderUpdate(fake.client, ev("set_l30a-1T", "FILLED", 0.004, 66000), BTC, { store });
+    const fifty = nowPlan("buy", 50);
+    await executeLive(fake.client, fifty, BTC, { store, setId: "set_l50a" });
+    expect(fake.of("POST", "/fapi/v3/leverage").map((c) => c.params.get("leverage"))).toEqual(["30", "50"]);
+    expect(legsOf(fake, 1).legs[0]!.quantity).toBe("0.007"); // $10 x 50 / 64,000 -> 0.007
+    expect(Number(legsOf(fake, 1).legs[2]!.stopPrice)).toBe(fifty.orders.stops[0]!.stopPrice); // nothing pulled in: no other Set
+  });
 
-    expect(fake.of("POST", "/fapi/v3/leverage").map((c) => c.params.get("leverage"))).toEqual(["30", "50"]); // the third Set changed nothing
-    expect(fake.state.leverage).toBe(50);
-    // Sizing stays the Set's own: $10 x 50 = $500 -> 0.007 BTC; $10 x 30 -> 0.004.
-    expect(legsOf(fake, 1).legs[0]!.quantity).toBe("0.007");
-    expect(legsOf(fake, 2).legs[0]!.quantity).toBe("0.004");
-    // The third (30x) Set's stop = 85% of the liquidation estimated at the symbol's 50x.
+  it("withSymbolLeverage (still used for ledgers saved before the ruling): a 30x plan on a coin standing at 50x gets the nearer 50x stop (REAL)", () => {
+    const third = nowPlan("buy", 30);
     const at50 = withSymbolLeverage(third, BTC, 50).orders.stops[0]!.stopPrice;
-    expect(Number(legsOf(fake, 2).legs[2]!.stopPrice)).toBe(at50);
-    expect(at50).toBeGreaterThan(third.orders.stops[0]!.stopPrice); // nearer the entry than the 30x stop
+    expect(at50).toBeGreaterThan(third.orders.stops[0]!.stopPrice);
+    expect(withSymbolLeverage(third, BTC, 30)).toBe(third);
   });
 
   it("symbolLeverageTarget: max of open Sets, never lower while open, follows the Set when none are open (REAL)", () => {
@@ -292,20 +290,28 @@ describe("Two Buy Sets at 30x and 50x on BTC", () => {
   });
 });
 
-/** Two filled Buy Sets A (30x, 0.004) and B (50x, 0.007) in one-way mode. */
+/**
+ * Two filled Buy Sets A (30x, 0.004) and B (50x, 0.007) on BTC in one-way mode: a ledger
+ * saved before the never-merge ruling (new Sets can no longer get there), which the
+ * executor must still handle.
+ */
 async function twoFilledBuys() {
-  const fake = fakeAster({ dual: false, leverage: 30, rows: [{ positionSide: "BOTH", positionAmt: 0 }] });
-  const store = memoryLedgerStore();
-  await executeLive(fake.client, nowPlan("buy", 30), BTC, { store, setId: "set_aaa" });
-  fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0.004, entryPrice: 64000, liquidationPrice: 62200 }];
-  await handleOrderUpdate(fake.client, ev("set_aaa-1E", "FILLED", 0.004, 64000), BTC, { store });
-  await executeLive(fake.client, nowPlan("buy", 50), BTC, { store, setId: "set_bbb" });
-  fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0.011, entryPrice: 64000, liquidationPrice: 62900 }];
-  await handleOrderUpdate(fake.client, ev("set_bbb-1E", "FILLED", 0.007, 64000), BTC, { store });
+  const fake = fakeAster({ dual: false, leverage: 50, rows: [{ positionSide: "BOTH", positionAmt: 0.011, entryPrice: 64000, liquidationPrice: 62900 }] });
+  let ledger = emptyLedger();
+  const mk = (id: string, leverage: number, qty: number, stopPrice: number, strategyId: string) => {
+    const r = createSetRecord({ id, symbol: "BTCUSDT", side: "buy", leverage, ticketUsd: 10, positionMode: "one-way", now: 0, legs: [{ entryType: "MARKET", qty, price: null, takeProfitPrice: 66000, stopPrice }] });
+    r.legs[0]!.sent = "sent";
+    r.legs[0]!.strategyId = strategyId;
+    return r;
+  };
+  ledger.sets.push(mk("set_aaa", 30, 0.004, 62400, "100"), mk("set_bbb", 50, 0.007, 63000, "101"));
+  ledger = applyOrderUpdate(ledger, ev("set_aaa-1E", "FILLED", 0.004, 64000), 1).ledger;
+  ledger = applyOrderUpdate(ledger, ev("set_bbb-1E", "FILLED", 0.007, 64000), 2).ledger;
+  const store = memoryLedgerStore(ledger);
   return { fake, store };
 }
 
-describe("One Set's stop fills while the other stays open", () => {
+describe("One Set's stop fills while the other stays open (ledger from before the ruling)", () => {
   it("cancels only that Set's take-profit; the other Set keeps its exits at its own quantity (HYBRID)", async () => {
     const { fake, store } = await twoFilledBuys();
     const before = store.current().sets.find((s) => s.id === "set_bbb")!.legs[0]!;
@@ -482,29 +488,50 @@ describe("Refusals before anything is sent (HYBRID, negative)", () => {
     expect(checkMarginForSet({ ledger, ticketUsd: 10, availableBalanceUsd: 12, walletBalanceUsd: 20 })).toEqual({ ok: true });
   });
 
-  it("a large Set that pulls the liquidation more than 30% closer is refused, nothing sent", async () => {
-    // Own long 0.05 BTC; free balance $400 carries a $100 ticket, but the cushion is thin.
-    const fake = fakeAster({ dual: false, leverage: 30, rows: [{ positionSide: "BOTH", positionAmt: 0.05, entryPrice: 64000, liquidationPrice: 60000 }], wallet: 520, available: 400 });
+  it("a large Set on BTC that pulls the user's ETH liquidation more than 30% closer is refused, nothing sent (cross margin links coins)", async () => {
+    // Own ETH long 1 at 3,000 on cross margin; BTC is flat. Cushion 168 before, about 108 after the $100 x 100 BTC Set.
+    const fake = fakeAster({ dual: false, leverage: 30, rows: [{ positionSide: "BOTH", positionAmt: 0 }], wallet: 180, available: 140, others: [{ symbol: "ETHUSDT", positionAmt: 1, entryPrice: 3000, markPrice: 3000 }] });
     const plan = buildSetPlan({ input: { symbol: "BTCUSDT", side: "buy", ticketUsd: 100, leverage: 100, tpMode: "deserved", entryMode: "now" }, currentPrice: 64000, rules: BTC, levels: NO_LEVELS, random: () => 0.5 });
     const r = await executeLive(fake.client, plan, BTC, { store: memoryLedgerStore(), setId: "set_big" });
-    expect(r.ok === false && r.refused && r.message).toMatch(/closer to the price \(the limit is 30%\)/);
+    expect(r.ok === false && r.refused && r.message).toMatch(/your ETH long's liquidation from [\d.]+ to [\d.]+: 3\d% closer to the price \(the limit is 30%\)/);
     expect(fake.of("POST", "/fapi/v3/placeStrategyOrder")).toHaveLength(0);
+    // A $10 Set leaves the ETH cushion almost untouched and goes out.
+    expect((await executeLive(fake.client, nowPlan("buy", 30), BTC, { store: memoryLedgerStore(), setId: "set_small" })).ok).toBe(true);
   });
 });
 
-describe("A Set next to the user's own trade on the same coin (2026-11-19)", () => {
-  it("is placed with a warning; his position becomes the outside baseline; the entry leg carries the root trigger ids Aster requires (HYBRID)", async () => {
+describe("Never merge: refused before anything is sent (2026-11-20)", () => {
+  it("the user's own position on the coin refuses the Set with a plain message: no order, no leverage change, no account read, no outside baseline (HYBRID, negative)", async () => {
     const fake = fakeAster({ dual: false, leverage: 30, rows: [{ positionSide: "BOTH", positionAmt: 0.067, entryPrice: 63530, liquidationPrice: 59286 }], wallet: 300, available: 170 });
     const store = memoryLedgerStore();
     const r = await executeLive(fake.client, nowPlan("buy", 30), BTC, { store, setId: "set_next" });
-    expect(r.ok).toBe(true);
-    expect(r.ok && r.warnings.join(" ")).toMatch(/already hold a BTC long of 0.067. This Set merges into it/);
-    expect(store.current().outside).toEqual({ BTCUSDT: { BOTH: 0.067 } });
-    const { legs } = legsOf(fake, 0);
-    expect(legs[0]).toMatchObject({ strategySubId: "1", firstDrivenId: "0", secondDrivenId: "0" });
+    expect(r).toMatchObject({ ok: false, refused: true, message: `BTC already has an open position. ${NEVER}` });
+    expect(fake.of("POST", "/fapi/v3/placeStrategyOrder")).toHaveLength(0);
+    expect(fake.of("POST", "/fapi/v3/leverage")).toHaveLength(0);
+    expect(fake.of("GET", "/fapi/v3/account")).toHaveLength(0);
+    expect(store.current()).toEqual(emptyLedger());
+    // A short of his own blocks a Buy Set the same way (one-way: it would net against it).
+    fake.state.rows = [{ positionSide: "BOTH", positionAmt: -0.01, entryPrice: 64000, liquidationPrice: 66000 }];
+    expect(await executeLive(fake.client, nowPlan("buy", 30), BTC, { store, setId: "set_next2" })).toMatchObject({ ok: false, refused: true });
   });
 
-  it("reconcile: cutting his own part moves the baseline and keeps the Sets; closing everything cancels the Sets (negative)", () => {
+  it("a position on another coin does not block; the entry leg carries the root trigger ids Aster requires (HYBRID)", async () => {
+    const fake = fakeAster({ dual: false, leverage: 30, rows: [{ positionSide: "BOTH", positionAmt: 0 }], wallet: 300, available: 170, others: [{ symbol: "ETHUSDT", positionAmt: 0.166, entryPrice: 1805.73, markPrice: 1805 }] });
+    const r = await executeLive(fake.client, nowPlan("buy", 30), BTC, { store: memoryLedgerStore(), setId: "set_free" });
+    expect(r.ok).toBe(true);
+    expect(r.ok && r.warnings.join(" ")).not.toMatch(/merges/);
+    expect(legsOf(fake, 0).legs[0]).toMatchObject({ strategySubId: "1", firstDrivenId: "0", secondDrivenId: "0" });
+  });
+
+  it("checkCoinIsFree: flat and no live Set passes; any position or a live Set refuses, naming the coin (REAL, negative)", () => {
+    expect(checkCoinIsFree({ symbol: "ETHUSDT", positionAmts: [0], liveSetIds: [] })).toEqual({ ok: true });
+    expect(checkCoinIsFree({ symbol: "ETHUSDT", positionAmts: [], liveSetIds: [] })).toEqual({ ok: true });
+    expect(checkCoinIsFree({ symbol: "ETHUSDT", positionAmts: [0.166], liveSetIds: [] })).toEqual({ ok: false, message: `ETH already has an open position. ${NEVER}` });
+    expect(checkCoinIsFree({ symbol: "ETHUSDT", positionAmts: [0, -0.1], liveSetIds: [] }).ok).toBe(false);
+    expect(checkCoinIsFree({ symbol: "ETHUSDT", positionAmts: [0], liveSetIds: ["set_a"] })).toEqual({ ok: false, message: `ETH already has a live Set (set_a). ${NEVER}` });
+  });
+
+  it("a ledger saved with the user's own part (2026-11-19 to 20) still reconciles: cutting his part keeps the Sets; closing everything cancels them (REAL, negative)", () => {
     let ledger = emptyLedger();
     ledger.outside = { BTCUSDT: { BOTH: 0.067 } };
     const set = createSetRecord({ id: "set_r1", symbol: "BTCUSDT", side: "buy", leverage: 30, ticketUsd: 10, positionMode: "one-way", now: 0, legs: [{ entryType: "MARKET", qty: 0.004, price: null, takeProfitPrice: 67000, stopPrice: 62000 }] });
@@ -583,9 +610,24 @@ describe("Order events from Aster's user data stream (REAL)", () => {
       commissionAsset: "USDT",
       tradeId: "42",
       time: 1568879465651,
+      cumulativeFilledQty: 0.004,
     });
     expect(parseOrderTradeUpdate({ e: "ACCOUNT_UPDATE" })).toBeNull();
     expect(() => parseOrderTradeUpdate({ e: "ORDER_TRADE_UPDATE", o: {} })).toThrow(/without symbol or status/);
+  });
+
+  it("a fill caught up from a query and then delivered by the stream under another id counts once (cumulative filled quantity) (REAL, negative)", () => {
+    let ledger = emptyLedger();
+    ledger.sets.push(createSetRecord({ id: "set_cum", symbol: "BTCUSDT", side: "buy", leverage: 30, ticketUsd: 10, positionMode: "one-way", now: 0, legs: [{ entryType: "LIMIT", qty: 0.004, price: 63900, takeProfitPrice: 66000, stopPrice: 62400 }] }));
+    ledger = applyOrderUpdate(ledger, { ...ev("set_cum-1E", "FILLED", 0.004, 63900, "catchup:set_cum-1E:0.004"), cumulativeFilledQty: 0.004 }, 1).ledger;
+    const again = applyOrderUpdate(ledger, { ...ev("set_cum-1E", "FILLED", 0.004, 63900, "77"), cumulativeFilledQty: 0.004 }, 2);
+    expect(again.actions).toEqual([]);
+    expect(filledQty(again.ledger.sets[0]!.legs[0]!.entry)).toBe(0.004);
+    // A missed partial: the cumulative says 0.003 in all, so 0.003 is recorded, not the event's 0.001.
+    let l2 = emptyLedger();
+    l2.sets.push(createSetRecord({ id: "set_cu2", symbol: "BTCUSDT", side: "buy", leverage: 30, ticketUsd: 10, positionMode: "one-way", now: 0, legs: [{ entryType: "LIMIT", qty: 0.004, price: 63900, takeProfitPrice: 66000, stopPrice: 62400 }] }));
+    l2 = applyOrderUpdate(l2, { ...ev("set_cu2-1E", "PARTIALLY_FILLED", 0.001, 63900, "80"), cumulativeFilledQty: 0.003 }, 1).ledger;
+    expect(filledQty(l2.sets[0]!.legs[0]!.entry)).toBe(0.003);
   });
 
   it("a venue liquidation on a coin with open Sets asks for a reconcile; an exit vanishing while the Set is open is flagged loudly", () => {

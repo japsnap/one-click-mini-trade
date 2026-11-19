@@ -34,9 +34,10 @@
 import { estimateLiquidationPrice, liquidationDistance } from "./liquidation";
 import { roundToTick } from "./rounding";
 import type { LeverageBracket, Side } from "./types";
+import { activeRules, DEFAULT_RULES } from "../rules/rules";
 
 /** Share of the liquidation distance at which the stop sits. 0.85 = 85%. */
-export const STOP_FRACTION_OF_LIQUIDATION = 0.85;
+export const STOP_FRACTION_OF_LIQUIDATION = DEFAULT_RULES.stop.fractionOfLiquidation;
 
 /**
  * Maintenance margin rate assumed when Aster's brackets are not available (trial mode,
@@ -46,7 +47,7 @@ export const STOP_FRACTION_OF_LIQUIDATION = 0.85;
  * 85% stop stays in front of it. A Set's position is at most $100 x 100 = $10,000, the
  * first bracket on every major symbol. Must stay below 1/leverage (1% at 100x).
  */
-export const DEFAULT_ASSUMED_MAINTENANCE_RATE = 0.005;
+export const DEFAULT_ASSUMED_MAINTENANCE_RATE = DEFAULT_RULES.risk.assumedMaintenanceRate;
 
 /** Where the maintenance rate came from, shown in the plan and the log. */
 export type MaintenanceSource = "brackets" | "assumed";
@@ -87,7 +88,7 @@ export function resolveMaintenanceRate(args: {
     rate = b.maintMarginRatio;
     source = "brackets";
   } else {
-    rate = args.assumedRate ?? DEFAULT_ASSUMED_MAINTENANCE_RATE;
+    rate = args.assumedRate ?? activeRules().risk.assumedMaintenanceRate;
     source = "assumed";
   }
   // A rate at or above 1/leverage would liquidate the position the moment it opens.
@@ -108,7 +109,7 @@ export function stopPriceFromLiquidation(
   liquidationPrice: number,
   side: Side,
   tickSize: number,
-  fraction: number = STOP_FRACTION_OF_LIQUIDATION,
+  fraction: number = activeRules().stop.fractionOfLiquidation,
 ): number {
   if (!(entry > 0) || !(liquidationPrice > 0)) throw new InvalidStopError("entry and liquidation must be positive prices");
   if (!(fraction > 0 && fraction < 1)) throw new InvalidStopError(`stop fraction must be between 0 and 1, got ${fraction}`);
@@ -152,7 +153,7 @@ export function planStop(args: {
   maintenanceSource: MaintenanceSource;
   fraction?: number;
 }): StopPlan {
-  const fraction = args.fraction ?? STOP_FRACTION_OF_LIQUIDATION;
+  const fraction = args.fraction ?? activeRules().stop.fractionOfLiquidation;
   const liquidationPrice = estimateLiquidationPrice(args.entry, args.leverage, args.side, args.maintenanceMarginRate);
   const stopPrice = stopPriceFromLiquidation(args.entry, liquidationPrice, args.side, args.tickSize, fraction);
   return {
@@ -194,7 +195,7 @@ export function planStop(args: {
 // venue's liquidation sits far away, and the Set must still stop at 85% of its own ticket.
 
 /** Share of the ticket a Set may lose before its stop fires. 0.85 = 85%. */
-export const STOP_FRACTION_OF_TICKET = 0.85;
+export const STOP_FRACTION_OF_TICKET = DEFAULT_RULES.stop.fractionOfTicket;
 
 /**
  * The price at which a Set of `qty` entered at `entry` has lost `fraction` of `ticketUsd`.
@@ -210,7 +211,7 @@ export function stopFromTicketLoss(args: {
   tickSize: number;
   fraction?: number;
 }): number {
-  const fraction = args.fraction ?? STOP_FRACTION_OF_TICKET;
+  const fraction = args.fraction ?? activeRules().stop.fractionOfTicket;
   if (!(args.entry > 0) || !(args.qty > 0) || !(args.ticketUsd > 0)) throw new InvalidStopError("entry, qty and ticket must be positive");
   if (!(fraction > 0 && fraction < 1)) throw new InvalidStopError(`ticket fraction must be between 0 and 1, got ${fraction}`);
   const dist = (fraction * args.ticketUsd) / args.qty; // price move that costs fraction x ticket

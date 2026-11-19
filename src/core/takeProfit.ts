@@ -35,12 +35,17 @@
 import { liquidationDistance } from "./liquidation";
 import { roundToTick } from "./rounding";
 import type { Level, RandomSource, Side, TpMode } from "./types";
+import { activeRules, DEFAULT_RULES, type SetRules } from "../rules/rules";
 
-/** Minimum reward-to-risk ratio for each mode. Units: plain multiplier. */
-export const TP_MIN_RATIO: Readonly<Record<TpMode, number>> = { shy: 1, deserved: 2, greedy: 4 };
+/** Minimum reward-to-risk ratio of each mode in a rule set. Units: plain multiplier. */
+export function tpMinRatios(r: SetRules = activeRules()): Readonly<Record<TpMode, number>> {
+  return { shy: r.target.shy, deserved: r.target.deserved, greedy: r.target.greedy };
+}
+/** The default ratios (1, 2, 4). pickTakeProfit reads the active rules. */
+export const TP_MIN_RATIO: Readonly<Record<TpMode, number>> = tpMinRatios(DEFAULT_RULES);
 
 /** Default tolerance for the round-number snap: up to 35% of the target distance beyond the exact target. */
-export const DEFAULT_SNAP_TOLERANCE = 0.35;
+export const DEFAULT_SNAP_TOLERANCE = DEFAULT_RULES.target.roundNumberReach;
 
 /** Volume-zone search knobs. Units: decimal fractions unless named Usd. */
 export interface TpZoneOptions {
@@ -56,13 +61,17 @@ export interface TpZoneOptions {
   zoneJitter: number;
 }
 
-export const DEFAULT_TP_ZONE_OPTIONS: TpZoneOptions = {
-  zoneReach: 1.5,
-  zoneBucketWidth: 0.0005,
-  zoneMinWeightUsd: 25_000,
-  zoneFrontGap: 0.0003,
-  zoneJitter: 0.0003,
-};
+/** The wall-search knobs of a rule set. */
+export function tpZoneOptionsFromRules(r: SetRules = activeRules()): TpZoneOptions {
+  return {
+    zoneReach: r.target.wallSearchReach,
+    zoneBucketWidth: r.target.wallBandWidth,
+    zoneMinWeightUsd: r.target.wallMinUsd,
+    zoneFrontGap: r.target.wallFrontGap,
+    zoneJitter: r.target.wallJitter,
+  };
+}
+export const DEFAULT_TP_ZONE_OPTIONS: TpZoneOptions = tpZoneOptionsFromRules(DEFAULT_RULES);
 
 /** Thrown when a requested ratio is below 1x. A Set never risks more than it can win. */
 export class RatioBelowOneError extends Error {
@@ -265,9 +274,9 @@ export function findVolumeZone(args: {
  * Units: prices quote per base; returned ratio a plain multiplier.
  */
 export function pickTakeProfit(input: PickTakeProfitInput): TakeProfitPick {
-  const tolerance = input.tolerance ?? DEFAULT_SNAP_TOLERANCE;
-  const z: TpZoneOptions = { ...DEFAULT_TP_ZONE_OPTIONS, ...input.zone };
-  const minRatio = input.minRatioOverride ?? TP_MIN_RATIO[input.mode];
+  const tolerance = input.tolerance ?? activeRules().target.roundNumberReach;
+  const z: TpZoneOptions = { ...tpZoneOptionsFromRules(), ...input.zone };
+  const minRatio = input.minRatioOverride ?? tpMinRatios()[input.mode];
   assertRatioAtLeastOne(minRatio);
   const { entry, side, tickSize } = input;
   const stopOnRightSide = side === "buy" ? input.stopPrice < entry : input.stopPrice > entry;

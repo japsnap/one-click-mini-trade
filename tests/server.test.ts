@@ -30,6 +30,11 @@ describe("config", () => {
     expect(() => loadConfig({ ASTER_BUILDER_ADDRESS: A, ASTER_BUILDER_FEE_RATE: "0.01" })).toThrow(/at most/);
     expect(() => loadConfig({ ASTER_BASE_URL: "http://insecure" })).toThrow(/https/);
   });
+  it("ASTER_EXIT_REDUCE_ONLY defaults to false; only true or false are accepted (negative)", () => {
+    expect(loadConfig({}).reduceOnlyExits).toBe(false);
+    expect(loadConfig({ ASTER_EXIT_REDUCE_ONLY: "true" }).reduceOnlyExits).toBe(true);
+    expect(() => loadConfig({ ASTER_EXIT_REDUCE_ONLY: "yes" })).toThrow(/ASTER_EXIT_REDUCE_ONLY/);
+  });
   it("never prints a secret value", () => {
     const c = loadConfig({ ASTER_USER: A, ASTER_SIGNER: A, ASTER_SIGNER_PRIVATE_KEY: K, LIVE_TRADING: "true" });
     const line = describeConfig(c);
@@ -92,6 +97,16 @@ describe("plan -> Aster OTOCO legs (entry, take-profit, stop)", () => {
     expect(l!.stop.positionSide).toBe("LONG");
     expect(l!.takeProfit.reduceOnly).toBeUndefined();
     expect(l!.stop.reduceOnly).toBeUndefined();
+  });
+  it("reduce-only exits when switched on: one-way only, both exits carry reduceOnly \"true\", the entry never; hedge mode never (Aster forbids it there)", () => {
+    const [on] = planToSetLegs(plan, BTC, false, "set_ro1", { reduceOnlyExits: true });
+    expect(on!.takeProfit.reduceOnly).toBe("true");
+    expect(on!.stop.reduceOnly).toBe("true");
+    expect(on!.entry.reduceOnly).toBeUndefined();
+    const [hedge] = planToSetLegs(plan, BTC, true, "set_ro2", { reduceOnlyExits: true });
+    expect(hedge!.takeProfit.reduceOnly).toBeUndefined();
+    expect(hedge!.stop.reduceOnly).toBeUndefined();
+    expect(hedge!.stop.positionSide).toBe("LONG");
   });
   it("refuses off-tick prices, a missing stop, and a stop beyond liquidation before signing (negative)", () => {
     const broken = { ...plan, orders: { ...plan.orders, entries: [{ type: "LIMIT" as const, price: 63900.05, qty: 0.023 }] } };

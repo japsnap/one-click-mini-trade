@@ -10,22 +10,27 @@
  *  - "Usd" suffixed values: US dollars (USDT treated as 1 USD)
  *  - percentages are decimal fractions: 0.005 means 0.5%
  */
+import { DEFAULT_RULES } from "../rules/defaultRules";
 
 /** Direction of the Set. "buy" opens a long position, "sell" opens a short one. */
 export type Side = "buy" | "sell";
 
-/** Allowed ticket sizes in USD. The ticket is the margin: the most the user can lose. */
-export type TicketUsd = 10 | 30 | 100;
-export const TICKETS_USD: readonly TicketUsd[] = [10, 30, 100];
+/**
+ * Ticket sizes in USD. The ticket is the margin: the most the user can lose. The offered
+ * sizes come from the active rules ("ticket.choices", default 10, 30, 100), so the type is
+ * a plain number; TICKETS_USD lists the defaults.
+ */
+export type TicketUsd = number;
+export const TICKETS_USD: readonly TicketUsd[] = DEFAULT_RULES.ticket.choices;
 
 /**
- * Allowed leverage multipliers. Position size = ticket x leverage.
- * LEVERAGES is what core validation accepts (30x, 50x, 100x). The card shows only
- * CARD_LEVERAGES (30x, 50x); 100x is an advanced choice inside the options sheet
- * (owner rule 2026-11-16), so ADVANCED_LEVERAGES lists it separately.
+ * Leverage multipliers. Position size = ticket x leverage. Offered in the options sheet
+ * from the active rules ("leverage.choices", default 30x, 50x, 100x; owner rule
+ * 2026-11-20: the card itself asks only Side and Ticket). CARD_LEVERAGES and
+ * ADVANCED_LEVERAGES are the older split, kept for callers that still read them.
  */
-export type Leverage = 30 | 50 | 100;
-export const LEVERAGES: readonly Leverage[] = [30, 50, 100];
+export type Leverage = number;
+export const LEVERAGES: readonly Leverage[] = DEFAULT_RULES.leverage.choices;
 export const CARD_LEVERAGES: readonly Leverage[] = [30, 50];
 export const ADVANCED_LEVERAGES: readonly Leverage[] = [100];
 
@@ -153,11 +158,11 @@ export interface LeverageBracket {
   maintMarginRatio: number;
 }
 
-/** The card's starting choices (owner rules 2026-11-16). */
+/** The card's starting choices under the default rules (owner rules 2026-11-16 and 2026-11-20). */
 export const DEFAULT_CHOICES = {
   side: "buy" as Side,
-  ticketUsd: 10 as TicketUsd,
-  leverage: 30 as Leverage,
-  tpMode: "deserved" as TpMode,
-  entryMode: "nearby" as EntryMode,
+  ticketUsd: DEFAULT_RULES.ticket.default as TicketUsd,
+  leverage: DEFAULT_RULES.leverage.default as Leverage,
+  tpMode: DEFAULT_RULES.target.default as TpMode,
+  entryMode: DEFAULT_RULES.entry.default as EntryMode,
 };

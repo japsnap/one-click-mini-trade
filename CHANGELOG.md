@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-20: never merge, the watcher, the rules window, a two-choice card
+
+- Never merge (owner's ruling): a new Set is refused when its coin already holds any position (his own or a Set's, either side) or a live Set; plain refusal text, nothing sent (`checkCoinIsFree` in `src/core/risk.ts`, `preTradeCheck`). The merge warning and the outside-baseline path for new Sets are gone; old ledgers with `outside` still reconcile. Margin, liquidation-shrink and stop checks stay (cross margin links coins).
+- Watcher (`server/watch.ts`, `scripts/watch.ts`, `--dry`): user data stream with listenKey keepalive every 30 min and reconnect with backoff, plus a positionRisk poll every 15 s. A live Set whose position is gone or no longer covers its fill, with exits still working, has both exits cancelled by client order id and is closed "closed outside the Set"; an exit read back as filled closes the Set by its own exit instead. Missed entry fills are caught up with `GET /fapi/v3/order`; a fill is never counted twice (cumulative filled quantity). Logs to `logs/watch.jsonl`. Started by the server in live mode.
+- Reduce-only exits: the V3 doc lists `reduceOnly` and `closePosition` on strategy sub-orders; `ASTER_EXIT_REDUCE_ONLY=true` adds `reduceOnly: "true"` to both exits in one-way mode. Default off (untested live).
+- Rules: every tunable number in `src/rules/defaultRules.ts`; override file from `SETS_RULES_FILE` or `rules/my-rules.json` (gitignored), checked at load (unknown key, wrong type, out of range, contradictions fail with the key's name); `GET /api/rules`; example `rules/my-rules.example.json`. No behaviour change at the defaults.
+- Card: asks only Side and Ticket; leverage (default 30x), target and entry moved into the options sheet; the options line shows the plan, e.g. "30x · target +5.2% ($12.9) · stop -2.4% ($6.0) · entry at 62,278.2". Screenshot `docs/set-card-live-2026-11-20.png`.
+- Tests: 124 before, 150 after (old "Set next to his own trade" and two-Sets-on-a-coin placements became refusal tests; the multi-Set executor tests start from a pre-ruling ledger). Trial smoke on live public data with no keys.
+
 
 ## 2026-11-19: first live Set; Sets next to the user's own trade
 

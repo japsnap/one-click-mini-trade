@@ -1,43 +1,60 @@
 /**
- * The options sheet: opened from the card's summary row (owner rule 2026-11-16).
+ * The options sheet: opened from the card's options line (owner rule 2026-11-20).
  * Holds the choices most users keep at their defaults:
- *  - Take-profit: Shy (>= 1x the loss), Deserved (>= 2x, default), Greedy (>= 4x)
+ *  - Leverage: the rule set's choices (default 30x, 50x, 100x; starts at 30x)
+ *  - Target: Shy, Deserved (default), Greedy, each winning at least N times the loss
  *  - When to enter: Now, Nearby (default), Patient, Draw
- *  - Advanced: 100x leverage (the card itself shows only 30x and 50x)
  * It slides up over the lower part of the card; tapping the dim area or Done closes it.
  * Every change applies at once (the plan behind the card refreshes), so Done only closes.
  *
- * State lives in SetCard; this component only shows it and reports taps.
+ * State lives in SetCard; this component only shows it and reports taps. The hints read
+ * their numbers from the rule set, so an override file changes the words too.
  */
 import styled from "styled-components";
 import { X } from "lucide-react";
 import { ENTRY_MODES, TP_MODES, type EntryMode, type Leverage, type TpMode } from "../core/types";
-import { TP_MIN_RATIO } from "../core/takeProfit";
+import type { SetRules } from "../rules/rules";
 import { theme } from "../theme";
 import { TP_LABEL, WHEN_LABEL } from "./setSummary";
 
+/** 0.005 -> "0.5%". */
+const pct = (f: number) => `${Number((f * 100).toFixed(2))}%`;
+
 /** One plain line under each entry mode, so the choice explains itself. */
-const WHEN_HINT: Record<EntryMode, string> = {
-  now: "Market order at the current price.",
-  nearby: "A limit among skilled traders' resting orders within 0.5%.",
-  patient: "A limit inside a cluster of other traders' liquidations 0.5% to 5% away. Falls back to Nearby when there is none.",
-  draw: "Paint where to enter and where to take profit.",
-};
+function whenHint(m: EntryMode, r: SetRules): string {
+  switch (m) {
+    case "now":
+      return "Market order at the current price.";
+    case "nearby":
+      return `A limit among skilled traders' resting orders within ${pct(r.entry.nearbyMaxDistance)}.`;
+    case "patient":
+      return `A limit inside a cluster of other traders' liquidations ${pct(r.entry.patientMinDistance)} to ${pct(r.entry.patientMaxDistance)} away. Falls back to Nearby when there is none.`;
+    case "draw":
+      return "Paint where to enter and where to take profit.";
+  }
+}
+
+/** How far price may move against the Set before its stop, as a rough share: stop share x (1/leverage - maintenance). */
+function leverageHint(lev: number, r: SetRules): string {
+  const move = r.stop.fractionOfLiquidation * (1 / lev - r.risk.assumedMaintenanceRate);
+  return `At ${lev}x a move of about ${pct(Math.round(move * 1000) / 1000)} against you reaches the stop.`;
+}
 
 export interface SetOptionsSheetProps {
   open: boolean;
+  rules: SetRules;
   tpMode: TpMode;
   entryMode: EntryMode;
   leverage: Leverage;
   onTpMode(m: TpMode): void;
   onEntryMode(m: EntryMode): void;
-  /** Turning 100x off returns to 30x, the card default. */
   onLeverage(l: Leverage): void;
   onClose(): void;
 }
 
 export function SetOptionsSheet(p: SetOptionsSheetProps) {
   if (!p.open) return null;
+  const r = p.rules;
   return (
     <Overlay onClick={p.onClose} data-testid="set-options-sheet">
       <Sheet role="dialog" aria-label="Set options" onClick={(e) => e.stopPropagation()}>
@@ -48,12 +65,22 @@ export function SetOptionsSheet(p: SetOptionsSheetProps) {
           </Close>
         </Head>
 
-        <Label>Take-profit</Label>
+        <Label>Leverage</Label>
+        <Seg>
+          {r.leverage.choices.map((l) => (
+            <Opt key={l} $on={p.leverage === l} aria-pressed={p.leverage === l} onClick={() => p.onLeverage(l)} $mono>
+              {l}x
+            </Opt>
+          ))}
+        </Seg>
+        <Hint>{leverageHint(p.leverage, r)}</Hint>
+
+        <Label>Target</Label>
         <Seg>
           {TP_MODES.map((m) => (
             <Opt key={m} $on={p.tpMode === m} aria-pressed={p.tpMode === m} onClick={() => p.onTpMode(m)}>
               {TP_LABEL[m]}
-              <Small>{`≥${TP_MIN_RATIO[m]}x loss`}</Small>
+              <Small>{`≥${r.target[m]}x loss`}</Small>
             </Opt>
           ))}
         </Seg>
@@ -66,20 +93,7 @@ export function SetOptionsSheet(p: SetOptionsSheetProps) {
             </Opt>
           ))}
         </Seg>
-        <Hint>{WHEN_HINT[p.entryMode]}</Hint>
-
-        <Label>Advanced</Label>
-        <Seg>
-          <Opt
-            $on={p.leverage === 100}
-            aria-pressed={p.leverage === 100}
-            onClick={() => p.onLeverage(p.leverage === 100 ? 30 : 100)}
-            $mono
-          >
-            100x leverage
-          </Opt>
-        </Seg>
-        {p.leverage === 100 && <Hint>At 100x a move of about 0.4% against you reaches the stop.</Hint>}
+        <Hint>{whenHint(p.entryMode, r)}</Hint>
 
         <Done onClick={p.onClose}>Done</Done>
       </Sheet>

@@ -9,3 +9,6 @@ dist/
 .cache/
 logs/
 .DS_Store
+
+# Each owner keeps his own rule set (rules/my-rules.example.json shows the shape).
+rules/my-rules.json

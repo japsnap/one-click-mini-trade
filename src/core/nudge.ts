@@ -12,9 +12,10 @@
  */
 import { roundToTick } from "./rounding";
 import type { RandomSource } from "./types";
+import { activeRules, DEFAULT_RULES } from "../rules/rules";
 
 /** Default maximum nudge as a fraction of the price: 0.0005 = 0.05%. */
-export const DEFAULT_NUDGE_FRACTION = 0.0005;
+export const DEFAULT_NUDGE_FRACTION = DEFAULT_RULES.entry.nudge;
 
 /** Result of nudgePrice. */
 export interface NudgeResult {
@@ -36,7 +37,7 @@ export function nudgePrice(
   price: number,
   tickSize: number,
   random: RandomSource,
-  maxFraction: number = DEFAULT_NUDGE_FRACTION,
+  maxFraction: number = activeRules().entry.nudge,
 ): NudgeResult {
   if (!(price > 0)) throw new RangeError(`price must be > 0, got ${price}`);
   if (!(maxFraction >= 0)) throw new RangeError(`maxFraction must be >= 0, got ${maxFraction}`);

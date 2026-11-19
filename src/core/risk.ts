@@ -1,16 +1,18 @@
 /**
- * Pre-trade risk check for a new Set on an account that may already hold positions
- * (Shota's rules, 2026-11-19):
+ * Pre-trade checks for a new Set on an account that may already hold positions.
+ *
+ * NEVER MERGE (owner's ruling, 2026-11-20). On one Aster account one coin holds one
+ * position, so a Set that shared a coin would merge into that position: one entry price,
+ * one liquidation, and closing either would close both. So a new Set is refused when its
+ * coin already has ANY open position (the user's own or another Set's) or a live Set in
+ * the ledger (checkCoinIsFree). Coins still share one cross-margin cushion, so:
  *  1. Margin: the free balance must carry the new ticket (checkMarginForSet in ledger.ts).
- *  2. Warning when the coin already has a position (his own trade or other Sets): the new
- *     Set merges into it, one liquidation price for both.
- *  3. Block when the Set moves any liquidation price too close: for every open position
- *     on the account, distance = |mark - liquidation| / mark. If the new Set shrinks that
- *     distance by more than LIQ_SHRINK_BLOCK (30%, the middle of his 20 to 40% range),
- *     the Set is refused.
- *  4. Block when a stop leaves its rule: every open Set's stop on the coin, and the new
- *     Set's own stop, must stay at most STOP_FRACTION (85%) of the way from its entry to
- *     the predicted liquidation price.
+ *  2. Block when the Set moves any other coin's liquidation too close: for every open
+ *     position on the account, distance = |mark - liquidation| / mark. If the new Set
+ *     shrinks that distance by more than the "risk.liquidationShrinkBlock" rule (30%), the
+ *     Set is refused; above "risk.liquidationShrinkWarn" (10%) it is a warning.
+ *  3. Block when the new Set's own stop leaves its rule: at most "stop.fractionOfLiquidation"
+ *     (85%) of the way from its entry to the predicted liquidation price.
  *
  * THE MODEL (cross margin, all positions share one cushion). The account is liquidated
  * when equity falls to the total maintenance margin. Cushion X = equity - maintenance,
@@ -32,11 +34,14 @@
  */
 import type { Side } from "./types";
 
-export const LIQ_SHRINK_BLOCK = 0.3;
-export const LIQ_SHRINK_WARN = 0.1;
-export const STOP_FRACTION = 0.85;
+import { activeRules, DEFAULT_RULES } from "../rules/rules";
+
+/** Defaults; checkNewSetRisk reads the active rules (src/rules/defaultRules.ts "risk", "stop"). */
+export const LIQ_SHRINK_BLOCK = DEFAULT_RULES.risk.liquidationShrinkBlock;
+export const LIQ_SHRINK_WARN = DEFAULT_RULES.risk.liquidationShrinkWarn;
+export const STOP_FRACTION = DEFAULT_RULES.stop.fractionOfLiquidation;
 /** Fee assumed for the new Set's fill, as a fraction of notional (taker plus builder, rounded up). */
-export const ASSUMED_FEE_RATE = 0.001;
+export const ASSUMED_FEE_RATE = DEFAULT_RULES.risk.assumedFeeRate;
 
 export interface RiskPosition {
   symbol: string;
@@ -159,7 +164,21 @@ const fmt = (x: number) => (x >= 100 ? x.toFixed(1) : x.toPrecision(5));
 const pct = (x: number) => `${Math.round(x * 100)}%`;
 
 /**
- * Run rules 2 to 4 for a new Set. Pure.
+ * Never merge: the coin must hold no open position (any side, the user's own or a Set's)
+ * and no live Set (pending or open) in the ledger. Pure. The message is plain, for the card.
+ */
+export function checkCoinIsFree(args: { symbol: string; positionAmts: number[]; liveSetIds: string[] }): { ok: true } | { ok: false; message: string } {
+  const coin = args.symbol.replace(/USDT$/, "");
+  const why = "A Set never shares a coin with another position, so nothing was sent.";
+  if (args.positionAmts.some((a) => a !== 0)) return { ok: false, message: `${coin} already has an open position. ${why}` };
+  if (args.liveSetIds.length > 0) return { ok: false, message: `${coin} already has a live Set (${args.liveSetIds.join(", ")}). ${why}` };
+  return { ok: true };
+}
+
+/**
+ * Run rules 2 and 3 for a new Set. Pure. The model stays general (it also handles a coin
+ * that already holds a position), but under the never-merge rule the new Set always opens
+ * a fresh position.
  * openStops: the active Sets on the new Set's symbol (their filled entry and current stop).
  */
 export function checkNewSetRisk(account: AccountRisk, set: NewSetForRisk, openStops: OpenSetStop[]): RiskVerdict {
@@ -182,16 +201,11 @@ export function checkNewSetRisk(account: AccountRisk, set: NewSetForRisk, openSt
   const mTarget = target && target.positionAmt !== 0 ? target.maintMarginUsd / (Math.abs(target.positionAmt) * target.markPrice) : set.maintenanceMarginRate;
   const mmBefore = target?.maintMarginUsd ?? 0;
   const mmAfter = Math.abs(qAfter) * mark * mTarget;
-  const fee = set.qty * set.price * ASSUMED_FEE_RATE;
+  const fee = set.qty * set.price * activeRules().risk.assumedFeeRate;
   const cushionAfter = account.cushionUsd + signed * (mark - set.price) - fee - (mmAfter - mmBefore);
 
-  if (qBefore !== 0) {
-    const own = qBefore > 0 ? "long" : "short";
-    warnings.push(
-      `You already hold a ${set.symbol.replace("USDT", "")} ${own} of ${Math.abs(qBefore)}. This Set merges into it: one position, one liquidation price. Closing the whole position in the app also closes this Set.`,
-    );
-  }
-
+  const { liquidationShrinkBlock: block, liquidationShrinkWarn: warn } = activeRules().risk;
+  const stopFraction = activeRules().stop.fractionOfLiquidation;
   const rows: RiskRow[] = [];
   let newLiquidation: number | null = null;
   const all = target ? cross : [...cross, { symbol: set.symbol, positionSide: wantSide, positionAmt: 0, entryPrice: set.price, markPrice: mark, maintMarginUsd: 0, isolated: false } as RiskPosition];
@@ -219,11 +233,11 @@ export function checkNewSetRisk(account: AccountRisk, set: NewSetForRisk, openSt
     rows.push({ symbol: p.symbol, positionSide: p.positionSide, qtyBefore: p.positionAmt, qtyAfter: q, liqBefore, liqAfter, distanceBefore: dB, distanceAfter: dA, shrink });
     if (p.positionAmt === 0) continue; // a new position has no "before" to shrink from
     const name = `${p.symbol.replace("USDT", "")} ${p.positionAmt > 0 ? "long" : "short"}`;
-    if (shrink > LIQ_SHRINK_BLOCK) {
+    if (shrink > block) {
       reasons.push(
-        `This Set moves your ${name}'s liquidation from ${liqBefore === null ? "none" : fmt(liqBefore)} to ${liqAfter === null ? "none" : fmt(liqAfter)}: ${pct(shrink)} closer to the price (the limit is ${pct(LIQ_SHRINK_BLOCK)}).`,
+        `This Set moves your ${name}'s liquidation from ${liqBefore === null ? "none" : fmt(liqBefore)} to ${liqAfter === null ? "none" : fmt(liqAfter)}: ${pct(shrink)} closer to the price (the limit is ${pct(block)}).`,
       );
-    } else if (shrink > LIQ_SHRINK_WARN) {
+    } else if (shrink > warn) {
       warnings.push(`Your ${name}'s liquidation moves ${pct(shrink)} closer: ${liqBefore === null ? "none" : fmt(liqBefore)} to ${liqAfter === null ? "none" : fmt(liqAfter)}.`);
     }
   }
@@ -237,9 +251,9 @@ export function checkNewSetRisk(account: AccountRisk, set: NewSetForRisk, openSt
       const toStop = Math.abs(s.entryPrice - s.stopPrice);
       const beyond = dir === "buy" ? s.stopPrice <= newLiquidation : s.stopPrice >= newLiquidation;
       const frac = toLiq > 0 ? toStop / toLiq : Number.POSITIVE_INFINITY;
-      if (beyond || frac > STOP_FRACTION + 1e-9) {
+      if (beyond || frac > stopFraction + 1e-9) {
         reasons.push(
-          `${s.setId === "this Set" ? "This Set's" : `Set ${s.setId}'s`} stop at ${fmt(s.stopPrice)} would sit ${beyond ? "past" : `${pct(frac)} of the way to`} the new liquidation ${fmt(newLiquidation)} (the rule is at most ${pct(STOP_FRACTION)}).`,
+          `${s.setId === "this Set" ? "This Set's" : `Set ${s.setId}'s`} stop at ${fmt(s.stopPrice)} would sit ${beyond ? "past" : `${pct(frac)} of the way to`} the new liquidation ${fmt(newLiquidation)} (the rule is at most ${pct(stopFraction)}).`,
         );
       }
     }

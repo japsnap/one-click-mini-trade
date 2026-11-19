@@ -29,7 +29,8 @@
  */
 import { privateKeyToAccount } from "viem/accounts";
 import { recoverTypedDataAddress, zeroAddress, type Hex } from "viem";
-import { stopPriceFromLiquidation, STOP_FRACTION_OF_LIQUIDATION } from "../core/stop";
+import { stopPriceFromLiquidation } from "../core/stop";
+import { activeRules } from "../rules/rules";
 import type { Level, LeverageBracket, OrderBookDepth, Side, SymbolRules } from "../core/types";
 import type { OrderUpdate } from "../core/ledger";
 
@@ -415,7 +416,7 @@ export function parseUsdtBalance(json: unknown): { walletBalanceUsd: number; ava
  * not an ORDER_TRADE_UPDATE. Field letters from the V3 doc "Event: Order Update":
  *   o.s symbol, o.c client order id, o.i order id, o.X status, o.x execution type,
  *   o.l last filled qty, o.L last filled price, o.n commission, o.N commission asset,
- *   o.t trade id, o.T trade time.
+ *   o.t trade id, o.T trade time, o.z the order's total filled quantity so far.
  * Every field is coerced; a message without a symbol or a status is refused loudly.
  */
 export function parseOrderTradeUpdate(json: unknown): OrderUpdate | null {
@@ -428,6 +429,7 @@ export function parseOrderTradeUpdate(json: unknown): OrderUpdate | null {
   const l = num(o.l);
   const L = num(o.L);
   const n = num(o.n);
+  const z = num(o.z);
   return {
     symbol: o.s,
     clientOrderId: typeof o.c === "string" ? o.c : "",
@@ -440,6 +442,58 @@ export function parseOrderTradeUpdate(json: unknown): OrderUpdate | null {
     commissionAsset: typeof o.N === "string" ? o.N : null,
     tradeId: Number.isFinite(t) && t > 0 ? String(t) : null,
     time: Number.isFinite(time) ? time : num(m.E) || 0,
+    ...(Number.isFinite(z) ? { cumulativeFilledQty: z } : {}),
+  };
+}
+
+/** One order as read back from GET /fapi/v3/order (V3 doc "Query Order"). */
+export interface QueriedOrder {
+  symbol: string;
+  clientOrderId: string;
+  orderId: string | null;
+  /** NEW, PARTIALLY_FILLED, FILLED, CANCELED, EXPIRED, REJECTED. */
+  status: string;
+  executedQty: number;
+  avgPrice: number;
+  updateTime: number;
+}
+
+/** Coerce a Query Order answer; a missing status or quantity fails loudly. */
+export function parseQueriedOrder(json: unknown): QueriedOrder {
+  const o = json !== null && typeof json === "object" ? (json as Record<string, unknown>) : null;
+  if (!o || typeof o.status !== "string" || typeof o.symbol !== "string") throw new Error("query order: answer has no symbol or status");
+  const executedQty = num(o.executedQty);
+  if (!Number.isFinite(executedQty)) throw new Error("query order: executedQty missing or not a number");
+  return {
+    symbol: o.symbol,
+    clientOrderId: typeof o.clientOrderId === "string" ? o.clientOrderId : "",
+    orderId: o.orderId === undefined || o.orderId === null ? null : String(o.orderId),
+    status: o.status,
+    executedQty,
+    avgPrice: num(o.avgPrice) || 0,
+    updateTime: num(o.updateTime) || num(o.time) || 0,
+  };
+}
+
+/**
+ * A queried order as a ledger OrderUpdate, so a missed stream event can be caught up.
+ * The cumulative filled quantity makes it safe to apply twice. Commission is not in the
+ * query answer, so a caught-up fill carries none (its Set's profit is then before that fee).
+ */
+export function queriedOrderToUpdate(q: QueriedOrder): OrderUpdate {
+  return {
+    symbol: q.symbol,
+    clientOrderId: q.clientOrderId,
+    orderId: q.orderId,
+    status: q.status,
+    executionType: q.executedQty > 0 ? "TRADE" : q.status === "CANCELED" ? "CANCELED" : q.status === "EXPIRED" ? "EXPIRED" : "NEW",
+    lastFilledQty: q.executedQty,
+    lastFilledPrice: q.avgPrice,
+    commission: 0,
+    commissionAsset: null,
+    tradeId: `catchup:${q.clientOrderId}:${q.executedQty}`,
+    time: q.updateTime,
+    cumulativeFilledQty: q.executedQty,
   };
 }
 
@@ -450,7 +504,7 @@ export function parseOrderTradeUpdate(json: unknown): OrderUpdate | null {
  * must keep the existing stop and say so, never guess.
  * Units: prices quote per base.
  */
-export function stopFromPositionRisk(row: PositionRiskRow, tickSize: number, fraction = STOP_FRACTION_OF_LIQUIDATION): { side: Side; stopPrice: number } {
+export function stopFromPositionRisk(row: PositionRiskRow, tickSize: number, fraction = activeRules().stop.fractionOfLiquidation): { side: Side; stopPrice: number } {
   if (!(row.liquidationPrice > 0)) throw new Error(`positionRisk ${row.symbol}: no liquidation price reported`);
   if (!(row.entryPrice > 0)) throw new Error(`positionRisk ${row.symbol}: no entry price reported`);
   const side: Side = row.positionAmt > 0 ? "buy" : "sell";
@@ -484,7 +538,7 @@ export class AsterClient {
   // ---------- low level ----------
 
   /** Send one HTTP request and parse JSON; throw AsterApiError on failure or a negative Aster code. */
-  private async send(method: "GET" | "POST" | "DELETE", path: string, query: string, body?: string): Promise<unknown> {
+  private async send(method: "GET" | "POST" | "PUT" | "DELETE", path: string, query: string, body?: string): Promise<unknown> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
     try {
@@ -525,8 +579,8 @@ export class AsterClient {
     return pyUrlencode(all);
   }
 
-  /** Sign and send. GET puts everything in the query; POST/DELETE in the form body. */
-  async signed(method: "GET" | "POST" | "DELETE", path: string, params: Array<[string, string]>): Promise<unknown> {
+  /** Sign and send. GET puts everything in the query; POST, PUT and DELETE in the form body. */
+  async signed(method: "GET" | "POST" | "PUT" | "DELETE", path: string, params: Array<[string, string]>): Promise<unknown> {
     if (!this.auth) throw new Error("signed Aster call needs user, signer and a signing key");
     const msg = this.buildSignedString(params, this.nextNonce());
     const signature = await this.auth.sign(msg);
@@ -691,6 +745,34 @@ export class AsterClient {
   /** GET /fapi/v3/account (Account Information v3): cushion and maintenance for the pre-trade risk check (core/risk.ts parseAccountRisk). */
   account() {
     return this.signed("GET", "/fapi/v3/account", []);
+  }
+
+  /**
+   * GET /fapi/v3/order by our client order id. null when Aster answers "order does not
+   * exist" (-2013): never placed, or cancelled unfilled more than 7 days ago.
+   */
+  async queryOrderByClientId(symbol: string, clientOrderId: string): Promise<QueriedOrder | null> {
+    try {
+      return parseQueriedOrder(await this.signed("GET", "/fapi/v3/order", [["symbol", symbol], ["origClientOrderId", clientOrderId]]));
+    } catch (e) {
+      if (e instanceof AsterApiError && e.code === -2013) return null;
+      throw e;
+    }
+  }
+
+  /**
+   * POST /fapi/v3/listenKey: the user data stream key. Answers the account's active key
+   * when one exists (so it never disturbs another app's stream) and extends it 60 minutes.
+   */
+  async startUserStream(): Promise<string> {
+    const j = (await this.signed("POST", "/fapi/v3/listenKey", [])) as { listenKey?: unknown };
+    if (typeof j?.listenKey !== "string" || j.listenKey === "") throw new Error("listenKey: answer has no key");
+    return j.listenKey;
+  }
+
+  /** PUT /fapi/v3/listenKey: keep the stream key alive another 60 minutes. Never DELETE: the key may be shared. */
+  keepAliveUserStream() {
+    return this.signed("PUT", "/fapi/v3/listenKey", []);
   }
 
   /** GET /fapi/v3/openOrders for one symbol. */

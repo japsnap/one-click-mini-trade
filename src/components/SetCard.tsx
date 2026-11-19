@@ -1,11 +1,12 @@
 /**
  * The Set card: one portrait (9:16) card, one big Enter button.
  *
- * Rows (owner rules 2026-11-16): Buy/Sell, Ticket ($10 / $30 / $100), Leverage (30x or
- * 50x on the card, default 30x), then ONE tappable summary row such as
- * "Deserved · Nearby ›" with the target price, win amount and max loss. Tapping it opens
- * the options sheet (SetOptionsSheet.tsx): take-profit mode (default Deserved), when to
- * enter (default Nearby) and 100x leverage as an advanced choice.
+ * Rows (owner rule 2026-11-20): the card asks only Side (Buy / Sell) and Ticket ($10 /
+ * $30 / $100). Below them ONE tappable options line shows what the options hold, from the
+ * current plan, for example "30x · target +5.2% ($15.6) · stop -2.6% ($7.9) · entry at
+ * market". Tapping it opens the options sheet (SetOptionsSheet.tsx): leverage (default
+ * 30x), target greed (default Deserved) and when to enter (default Nearby). Choices and
+ * defaults come from the rule set (api.getRules when the api offers it, else the defaults).
  * Nearby and Patient show "Checking traders' orders..." while the plan (which loads the
  * traders' levels) is fetched through TanStack Query, then the chosen price. When Patient
  * or Nearby falls back, the card itself says so (amber line), not only the sheet.
@@ -16,18 +17,19 @@
  * its own implementation (Privy wallet, its backend) and keeps this component unchanged.
  * The card needs a QueryClientProvider above it (Blackboard already has one).
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import styled from "styled-components";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { ArrowDownRight, ArrowUpRight, Bell, CheckCircle2, ChevronRight, Loader2, ShieldAlert, Skull } from "lucide-react";
+import { activeRules, type SetRules } from "../rules/rules";
 import type { SetAlertEvent } from "../core/alerts";
 import { estimateLiquidationPrice } from "../core/liquidation";
-import { CARD_LEVERAGES, DEFAULT_CHOICES, TICKETS_USD, type DrawBands, type EntryMode, type Leverage, type SetInput, type Side, type TicketUsd, type TpMode } from "../core/types";
+import type { DrawBands, EntryMode, Leverage, SetInput, Side, TicketUsd, TpMode } from "../core/types";
 import type { SetCardApi } from "../api/client";
 import { theme } from "../theme";
 import { PriceStrip } from "./PriceStrip";
 import { SetOptionsSheet } from "./SetOptionsSheet";
-import { fallbackNotice, px, summaryLines, usd } from "./setSummary";
+import { fallbackNotice, optionsLine, px, usd } from "./setSummary";
 import { useSetSession } from "./useSetSession";
 
 export interface SetCardProps {
@@ -38,11 +40,22 @@ export interface SetCardProps {
 }
 
 export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
-  const [side, setSide] = useState<Side>(DEFAULT_CHOICES.side);
-  const [ticketUsd, setTicket] = useState<TicketUsd>(DEFAULT_CHOICES.ticketUsd);
-  const [leverage, setLeverage] = useState<Leverage>(DEFAULT_CHOICES.leverage);
-  const [tpMode, setTpMode] = useState<TpMode>(DEFAULT_CHOICES.tpMode);
-  const [entryMode, setEntryMode] = useState<EntryMode>(DEFAULT_CHOICES.entryMode);
+  const fetchedRules = useQuery({ queryKey: ["set-rules"], queryFn: () => api.getRules!(), enabled: !!api.getRules, staleTime: Infinity, retry: false });
+  const rules: SetRules = fetchedRules.data ?? activeRules();
+  const [side, setSide] = useState<Side>("buy");
+  const [ticketUsd, setTicket] = useState<TicketUsd>(rules.ticket.default);
+  const [leverage, setLeverage] = useState<Leverage>(rules.leverage.default);
+  const [tpMode, setTpMode] = useState<TpMode>(rules.target.default);
+  const [entryMode, setEntryMode] = useState<EntryMode>(rules.entry.default);
+  // The server's rules arrive after the first render: start over on their defaults.
+  useEffect(() => {
+    if (!fetchedRules.data) return;
+    const r = fetchedRules.data;
+    setTicket(r.ticket.default);
+    setLeverage(r.leverage.default);
+    setTpMode(r.target.default);
+    setEntryMode(r.entry.default);
+  }, [fetchedRules.data]);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [bands, setBands] = useState<Partial<DrawBands>>({});
   const [painting, setPainting] = useState<"in" | "out">("in");
@@ -72,10 +85,8 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
   const inMid = bands.inBand ? (bands.inBand.low + bands.inBand.high) / 2 : undefined;
   const plan = preview.data?.plan;
   const loadingLevels = preview.isFetching && (entryMode === "nearby" || entryMode === "patient");
-  const summary = summaryLines(tpMode, entryMode, preview.isFetching ? null : plan);
+  const line = optionsLine(leverage, preview.isFetching ? null : plan);
   const notice = preview.isFetching ? null : fallbackNotice(plan);
-  // 100x is chosen in the sheet; while it is on, the card shows it as a third, active option.
-  const cardLeverages: readonly Leverage[] = CARD_LEVERAGES.includes(leverage) ? CARD_LEVERAGES : [...CARD_LEVERAGES, leverage];
 
   return (
     <Card>
@@ -96,26 +107,17 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
       </Row>
       <Row label="Ticket (max loss)">
         <Seg>
-          {TICKETS_USD.map((t) => (
+          {rules.ticket.choices.map((t) => (
             <Opt key={t} $on={ticketUsd === t} onClick={() => setTicket(t)} $mono>
               ${t}
             </Opt>
           ))}
         </Seg>
       </Row>
-      <Row label="Leverage">
-        <Seg>
-          {cardLeverages.map((l) => (
-            <Opt key={l} $on={leverage === l} onClick={() => setLeverage(l)} $mono>
-              {l}x
-            </Opt>
-          ))}
-        </Seg>
-      </Row>
-      <Summary type="button" aria-haspopup="dialog" onClick={() => setSheetOpen(true)} data-testid="set-summary-row">
+      <Summary type="button" aria-haspopup="dialog" aria-label="Options" onClick={() => setSheetOpen(true)} data-testid="set-summary-row">
         <SummaryText>
-          <SummaryTitle>{summary.title}</SummaryTitle>
-          <SummaryDetail>{summary.detail ?? (loadingLevels ? "Checking traders' orders..." : "...")}</SummaryDetail>
+          <SummaryTitle>Options</SummaryTitle>
+          <SummaryDetail>{loadingLevels ? `${leverage}x · checking traders' orders...` : line}</SummaryDetail>
         </SummaryText>
         <ChevronRight size={20} />
       </Summary>
@@ -200,6 +202,7 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
 
       <SetOptionsSheet
         open={sheetOpen}
+        rules={rules}
         tpMode={tpMode}
         entryMode={entryMode}
         leverage={leverage}

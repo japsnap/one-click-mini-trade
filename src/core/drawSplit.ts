@@ -30,14 +30,15 @@
  * estimate uses, when the symbol already stands above the Set's own leverage.
  */
 import { estimateLiquidationPrice } from "./liquidation";
-import { nudgePrice, DEFAULT_NUDGE_FRACTION } from "./nudge";
+import { nudgePrice } from "./nudge";
+import { activeRules, DEFAULT_RULES } from "../rules/rules";
 import { floorToStep, roundToTick } from "./rounding";
-import { DEFAULT_ASSUMED_MAINTENANCE_RATE, planStop, type MaintenanceSource } from "./stop";
+import { planStop, type MaintenanceSource } from "./stop";
 import { cleanRatio, RatioBelowOneError } from "./takeProfit";
 import type { DrawBands, PriceBand, RandomSource, Side, SymbolRules } from "./types";
 
 /** Hard cap on the number of entry orders per Set. */
-export const MAX_DRAW_ORDERS = 5;
+export const MAX_DRAW_ORDERS = DEFAULT_RULES.entry.drawMaxOrders;
 
 /** One leg of the ladder. Units: price quote per base; qty base units. */
 export interface DrawLeg {
@@ -143,7 +144,7 @@ export function splitDraw(args: {
   /** Leverage for the liquidation estimates (the symbol's, when higher than the Set's). Default: leverage. */
   liquidationLeverage?: number;
 }): DrawPlan {
-  const mmr = args.maintenanceMarginRate ?? DEFAULT_ASSUMED_MAINTENANCE_RATE;
+  const mmr = args.maintenanceMarginRate ?? activeRules().risk.assumedMaintenanceRate;
   const mmrSource: MaintenanceSource = args.maintenanceSource ?? "assumed";
   const { side, bands, rules } = args;
   validateBands(side, bands);
@@ -151,14 +152,14 @@ export function splitDraw(args: {
   // Smallest notional one order may have: the exchange minimum, or minQty at the
   // highest entry price (that order gets the smallest quantity for its dollars).
   const perOrderMin = Math.max(rules.minNotionalUsd, rules.minQty * bands.inBand.high);
-  const nMax = Math.min(MAX_DRAW_ORDERS, Math.floor(notional / perOrderMin));
+  const nMax = Math.min(activeRules().entry.drawMaxOrders, Math.floor(notional / perOrderMin));
   if (nMax < 1) throw new TicketTooSmallError(notional, perOrderMin);
 
   // Try the largest allowed N first, then fewer: step-size rounding can push a leg
   // just under the minimum, in which case one order fewer gives each leg more.
   for (let n = nMax; n >= 1; n--) {
     const entryPrices = spreadAcross(bands.inBand, n).map(
-      (p) => nudgePrice(p, rules.tickSize, args.random, args.nudgeFraction ?? DEFAULT_NUDGE_FRACTION).price,
+      (p) => nudgePrice(p, rules.tickSize, args.random, args.nudgeFraction ?? activeRules().entry.nudge).price,
     );
     const entries: DrawLeg[] = entryPrices
       // Each leg gets an equal share of the dollars; quantity rounded DOWN so the ticket is never exceeded.

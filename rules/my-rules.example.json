@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to rules/my-rules.json (kept out of git) and change only what you want; every other rule keeps its default from src/rules/defaultRules.ts. Or point SETS_RULES_FILE at any file. Keys starting with _ are notes. An unknown key, a wrong type or a value out of range stops the server and names the key.",
+  "target": {
+    "_comment": "Win at least this many times the loss at the stop.",
+    "shy": 1.5,
+    "deserved": 2.5,
+    "greedy": 5
+  },
+  "leverage": {
+    "choices": [20, 30, 50],
+    "default": 20
+  },
+  "ticket": {
+    "choices": [10, 30, 100],
+    "default": 30
+  },
+  "risk": {
+    "liquidationShrinkBlock": 0.25
+  }
+}

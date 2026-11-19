@@ -4,9 +4,10 @@
  * Why here and not in the server: the card and the server must agree on what a valid
  * Set is, and this has no dependencies, so both can import it.
  * Every field is checked against the allowed lists; anything else is rejected with a
- * message a person can read. Nothing is silently defaulted except tpMode (Deserved).
+ * message a person can read. Nothing is silently defaulted except tpMode (the rule "target.default").
  */
-import { ENTRY_MODES, LEVERAGES, TICKETS_USD, TP_MODES, type SetInput } from "./types";
+import { ENTRY_MODES, TP_MODES, type SetInput } from "./types";
+import { activeRules } from "../rules/rules";
 
 /** Thrown for a malformed Set request. The server maps it to HTTP 400. */
 export class InvalidSetInputError extends Error {
@@ -34,10 +35,11 @@ export function parseSetInput(raw: unknown): SetInput {
   const side = b.side;
   if (side !== "buy" && side !== "sell") throw new InvalidSetInputError('side must be "buy" or "sell"');
   const ticketUsd = n(b.ticketUsd);
-  if (!(TICKETS_USD as readonly number[]).includes(ticketUsd)) throw new InvalidSetInputError(`ticketUsd must be one of ${TICKETS_USD.join(", ")}`);
+  const rules = activeRules();
+  if (!rules.ticket.choices.includes(ticketUsd)) throw new InvalidSetInputError(`ticketUsd must be one of ${rules.ticket.choices.join(", ")}`);
   const leverage = n(b.leverage);
-  if (!(LEVERAGES as readonly number[]).includes(leverage)) throw new InvalidSetInputError(`leverage must be one of ${LEVERAGES.join(", ")}`);
-  const tpMode = b.tpMode ?? "deserved"; // Deserved is the product default
+  if (!rules.leverage.choices.includes(leverage)) throw new InvalidSetInputError(`leverage must be one of ${rules.leverage.choices.join(", ")}`);
+  const tpMode = b.tpMode ?? rules.target.default;
   if (!(TP_MODES as readonly unknown[]).includes(tpMode)) throw new InvalidSetInputError(`tpMode must be one of ${TP_MODES.join(", ")}`);
   const entryMode = b.entryMode;
   if (!(ENTRY_MODES as readonly unknown[]).includes(entryMode)) throw new InvalidSetInputError(`entryMode must be one of ${ENTRY_MODES.join(", ")}`);

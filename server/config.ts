@@ -6,9 +6,12 @@
  *  - A malformed value is a hard error at start (a typo must not quietly turn live
  *    trading on or raise the ticket cap).
  *  - LIVE_TRADING defaults to false: without an explicit "true" nothing is ever sent.
+ *  - The live caps default to the active rules ("live" in src/rules/defaultRules.ts), so
+ *    load the rules file before the config; MAX_LIVE_TICKET_USD, when set, wins.
  */
 import type { Hex } from "viem";
 import { ASTER_MAINNET_URL, validateBuilder, type BuilderConfig } from "../src/exchange/aster";
+import { activeRules } from "../src/rules/rules";
 
 /** The validated configuration. */
 export interface ServerConfig {
@@ -22,6 +25,8 @@ export interface ServerConfig {
   /** Present only when all three Aster credentials are set. */
   credentials: { user: Hex; signer: Hex; privateKey: Hex } | null;
   builder: BuilderConfig | null;
+  /** One-way mode: send both exits with reduceOnly "true" (ASTER_EXIT_REDUCE_ONLY, default false: untested live). */
+  reduceOnlyExits: boolean;
 }
 
 /** Thrown for any invalid environment value. */
@@ -49,7 +54,7 @@ export function loadConfig(env: Record<string, string | undefined>): ServerConfi
   if (liveRaw !== "true" && liveRaw !== "false") throw new ConfigError('LIVE_TRADING must be "true" or "false"');
   const liveTrading = liveRaw === "true";
 
-  const capRaw = get("MAX_LIVE_TICKET_USD") ?? "10";
+  const capRaw = get("MAX_LIVE_TICKET_USD") ?? String(activeRules().live.maxTicketUsd);
   const maxLiveTicketUsd = Number(capRaw);
   if (!Number.isFinite(maxLiveTicketUsd) || maxLiveTicketUsd <= 0) throw new ConfigError("MAX_LIVE_TICKET_USD must be a positive number");
 
@@ -83,11 +88,14 @@ export function loadConfig(env: Record<string, string | undefined>): ServerConfi
     }
   }
 
+  const roRaw = (get("ASTER_EXIT_REDUCE_ONLY") ?? "false").toLowerCase();
+  if (roRaw !== "true" && roRaw !== "false") throw new ConfigError('ASTER_EXIT_REDUCE_ONLY must be "true" or "false"');
+
   const portRaw = get("PORT") ?? "8787";
   const port = Number(portRaw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new ConfigError("PORT must be an integer 1-65535");
 
-  return { port, baseUrl, liveTrading, maxLiveTicketUsd, liveSymbols: ["BTCUSDT", "ETHUSDT"], credentials, builder };
+  return { port, baseUrl, liveTrading, maxLiveTicketUsd, liveSymbols: [...activeRules().live.symbols], credentials, builder, reduceOnlyExits: roRaw === "true" };
 }
 
 /** One safe line about the config: names and modes only, never a value of a secret. */
@@ -98,5 +106,6 @@ export function describeConfig(c: ServerConfig): string {
     `baseUrl=${c.baseUrl}`,
     `credentials=${c.credentials ? "set" : "not set"}`,
     `builder=${c.builder ? "set" : "not set"}`,
+    `reduceOnlyExits=${c.reduceOnlyExits}`,
   ].join(" ");
 }

@@ -9,9 +9,10 @@
  * (Aster's builder feeRate, if configured, is a separate per-trade fee charged by
  * the exchange on every fill; see src/exchange/aster.ts.)
  */
+import { activeRules, DEFAULT_RULES } from "../rules/rules";
 
 /** Default profit shares. Units: decimal fractions of the profit (0.05 = 5%). */
-export const DEFAULT_FEE_SHARES = { blackboard: 0.05, trader: 0.05 } as const;
+export const DEFAULT_FEE_SHARES = { blackboard: DEFAULT_RULES.profitShare.blackboard, trader: DEFAULT_RULES.profitShare.trader } as const;
 
 /** The split of one Set's result. Units: USD. */
 export interface FeeSplit {
@@ -32,7 +33,7 @@ export interface FeeSplit {
  */
 export function splitFees(
   pnlUsd: number,
-  shares: { blackboard: number; trader: number } = DEFAULT_FEE_SHARES,
+  shares: { blackboard: number; trader: number } = activeRules().profitShare,
 ): FeeSplit {
   if (!Number.isFinite(pnlUsd)) throw new RangeError(`pnlUsd must be finite, got ${pnlUsd}`);
   if (shares.blackboard < 0 || shares.trader < 0 || shares.blackboard + shares.trader > 1) {

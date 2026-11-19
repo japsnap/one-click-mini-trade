@@ -30,6 +30,7 @@
  * This file returns the raw level price. The caller nudges it (nudge.ts) and rounds it.
  */
 import type { EntryMode, LiquidationLevel, RandomSource, Side, SidedLevel, TraderLevels } from "./types";
+import { activeRules, DEFAULT_RULES, type SetRules } from "../rules/rules";
 
 /** Options with their defaults. All fractions are decimal (0.005 = 0.5%). */
 export interface EntryOptions {
@@ -55,16 +56,22 @@ export interface EntryOptions {
   patientBucketWidth: number;
 }
 
-export const DEFAULT_ENTRY_OPTIONS: EntryOptions = {
-  nearbyMaxDistance: 0.005,
-  nearbyMinDistance: 0.0005,
-  nearbyBucketWidth: 0.0005,
-  nearbyTopBuckets: 3,
-  nearbyMinWeightUsd: 5_000,
-  patientMinDistance: 0.005,
-  patientMaxDistance: 0.05,
-  patientBucketWidth: 0.001,
-};
+/** The entry knobs of a rule set (src/rules/defaultRules.ts). */
+export function entryOptionsFromRules(r: SetRules = activeRules()): EntryOptions {
+  return {
+    nearbyMaxDistance: r.entry.nearbyMaxDistance,
+    nearbyMinDistance: r.entry.nearbyMinDistance,
+    nearbyBucketWidth: r.entry.nearbyBandWidth,
+    nearbyTopBuckets: r.entry.nearbyTopBands,
+    nearbyMinWeightUsd: r.entry.nearbyMinUsd,
+    patientMinDistance: r.entry.patientMinDistance,
+    patientMaxDistance: r.entry.patientMaxDistance,
+    patientBucketWidth: r.entry.patientBandWidth,
+  };
+}
+
+/** The defaults, for callers that read them directly. Functions here read the active rules. */
+export const DEFAULT_ENTRY_OPTIONS: EntryOptions = entryOptionsFromRules(DEFAULT_RULES);
 
 /**
  * Structural counts of the level search, printed by the server so a zero is loud.
@@ -117,7 +124,7 @@ export function pickEntry(args: {
   random: RandomSource;
   options?: Partial<EntryOptions>;
 }): EntryDecision {
-  const o: EntryOptions = { ...DEFAULT_ENTRY_OPTIONS, ...args.options };
+  const o: EntryOptions = { ...entryOptionsFromRules(), ...args.options };
   const { side, currentPrice } = args;
   if (!(currentPrice > 0)) throw new RangeError(`currentPrice must be > 0, got ${currentPrice}`);
   const fellBackFrom: Exclude<EntryMode, "draw">[] = [];
@@ -196,7 +203,7 @@ export function nearbyBuckets(
   currentPrice: number,
   options: Partial<EntryOptions> = {},
 ): { buckets: NearbyBucket[]; counts: { ordersRead: number; ordersInWindow: number } } {
-  const o: EntryOptions = { ...DEFAULT_ENTRY_OPTIONS, ...options };
+  const o: EntryOptions = { ...entryOptionsFromRules(), ...options };
   const width = o.nearbyBucketWidth;
   // Highest bucket index inside the window: distance 0.5% exactly lands in the last bucket.
   const lastIndex = Math.max(0, Math.ceil(o.nearbyMaxDistance / width - 1e-9) - 1);
@@ -289,7 +296,7 @@ export function findLiquidationClusterWithCounts(
   cluster: { centre: number; weightUsd: number; bucketIndex: number } | null;
   counts: { liquidationsRead: number; liquidationsOnSide: number; liquidationsInWindow: number };
 } {
-  const o: EntryOptions = { ...DEFAULT_ENTRY_OPTIONS, ...options };
+  const o: EntryOptions = { ...entryOptionsFromRules(), ...options };
   const wanted = side === "buy" ? "long" : "short";
   const buckets = new Map<number, number>();
   let onSide = 0;
