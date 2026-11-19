@@ -327,7 +327,7 @@ async function probeLive() {
 await probeLive();
 if (cfg.liveTrading && cfg.credentials) {
   // Same ledger store object as the routes, so its lock keeps them from interleaving.
-  const watcher = new SetWatcher({ client: aster, store: ledgerStore, log: fileWatchLog(path.join(ROOT, "logs", "watch.jsonl")) });
+  const watcher = new SetWatcher({ client: aster, store: ledgerStore, reduceOnlyExits: cfg.reduceOnlyExits, log: fileWatchLog(path.join(ROOT, "logs", "watch.jsonl")) });
   await watcher.start();
 }
 server.listen(cfg.port, "127.0.0.1", () => {

@@ -41,6 +41,7 @@ const watcher = new SetWatcher({
   client,
   store: fileLedgerStore(path.join(ROOT, "logs", "set-ledger.json")),
   dry,
+  reduceOnlyExits: cfg.reduceOnlyExits,
   log: fileWatchLog(path.join(ROOT, "logs", "watch.jsonl")),
 });
 process.on("SIGINT", () => {

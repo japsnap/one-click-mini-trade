@@ -79,7 +79,16 @@ export interface WatcherOptions {
   openSocket?: (url: string) => SocketLike;
   /** Default wss://fstream.asterdex.com (V3 doc "User Data Streams"). */
   wsBaseUrl?: string;
+  /** Backup poll while a Set is open and its exits are NOT reduce-only. Default 15 s. */
   pollMs?: number;
+  /**
+   * The Sets' exits are reduce-only (ASTER_EXIT_REDUCE_ONLY=true): an exit can then only
+   * shrink a position, never open one, so a late cancel costs nothing and the backup poll
+   * slows to slowPollMs. The stream still reacts at once either way.
+   */
+  reduceOnlyExits?: boolean;
+  /** Backup poll when reduceOnlyExits is on. Default 60 s. */
+  slowPollMs?: number;
   keepaliveMs?: number;
   graceMs?: number;
   /** Reconnect delay: firstMs, doubled per failed try, at most maxMs. */
@@ -121,6 +130,10 @@ export class SetWatcher {
   private readonly openSocket: (url: string) => SocketLike;
   private readonly wsBaseUrl: string;
   private readonly pollMs: number;
+  /** How often the backup poll actually asks Aster: pollMs, or slowPollMs with reduce-only exits. */
+  private readonly askEveryMs: number;
+  /** When the poll last asked Aster; -Infinity = never. */
+  private lastAsked = -Infinity;
   private readonly keepaliveMs: number;
   private readonly graceMs: number;
   private readonly backoff: { firstMs: number; maxMs: number };
@@ -145,6 +158,7 @@ export class SetWatcher {
     this.openSocket = o.openSocket ?? ((url) => new WebSocket(url) as unknown as SocketLike);
     this.wsBaseUrl = (o.wsBaseUrl ?? "wss://fstream.asterdex.com").replace(/\/+$/, "");
     this.pollMs = o.pollMs ?? 15_000;
+    this.askEveryMs = o.reduceOnlyExits ? (o.slowPollMs ?? 60_000) : this.pollMs;
     this.keepaliveMs = o.keepaliveMs ?? 30 * 60_000;
     this.graceMs = o.graceMs ?? 5_000;
     this.backoff = o.reconnect ?? { firstMs: 1_000, maxMs: 60_000 };
@@ -161,8 +175,8 @@ export class SetWatcher {
   /** Start the stream, the poll and the keepalive. Never throws: failures are logged and retried. */
   async start(): Promise<void> {
     this.stopped = false;
-    this.log("info", "start", `watching live Sets: poll every ${this.pollMs / 1000} s, stream keepalive every ${this.keepaliveMs / 60_000} min, grace ${this.graceMs / 1000} s${this.dry ? ", dry run: nothing is cancelled" : ""}`);
-    await this.pollOnce();
+    this.log("info", "start", `watching live Sets: backup poll every ${this.askEveryMs / 1000} s while a Set is open (none while none is)${this.askEveryMs !== this.pollMs ? ", slower because exits are reduce-only" : ""}, stream keepalive every ${this.keepaliveMs / 60_000} min, grace ${this.graceMs / 1000} s${this.dry ? ", dry run: nothing is cancelled" : ""}`);
+    await this.pollOnce(true);
     await this.connect();
     this.timers.push(setInterval(() => void this.pollOnce(), this.pollMs));
     this.timers.push(
@@ -205,7 +219,7 @@ export class SetWatcher {
       this.attempts = 0;
       this.stats.streamOpens++;
       this.log("info", "stream", "user data stream open");
-      void this.pollOnce(); // events may have been missed while it was down
+      void this.pollOnce(true); // events may have been missed while it was down
     };
     ws.onmessage = (m) => void this.handleStreamMessage(String(m.data));
     ws.onerror = (e) => this.log("warn", "stream", `stream error ${(e as { message?: string })?.message ?? ""}`.trim());
@@ -271,12 +285,19 @@ export class SetWatcher {
 
   // ---------- poll and the rule ----------
 
-  /** Check every coin that has a live Set. */
-  async pollOnce(): Promise<void> {
-    this.stats.polls++;
+  /**
+   * The backup poll: check every coin that has a live Set. The timer ticks every pollMs,
+   * but it only asks Aster when a Set is open, and with reduce-only exits only every
+   * slowPollMs. force: ask now (start-up, stream reconnect).
+   */
+  async pollOnce(force = false): Promise<void> {
     try {
       const ledger = await this.store.load();
       const symbols = [...new Set(activeSets(ledger).map((s) => s.symbol))];
+      if (symbols.length === 0) return; // no open Set: nothing to ask Aster
+      if (!force && this.now() - this.lastAsked < this.askEveryMs) return;
+      this.lastAsked = this.now();
+      this.stats.polls++;
       for (const s of symbols) await this.checkSymbol(s, "poll");
       this.pollFailures = 0;
     } catch (e) {
@@ -308,7 +329,7 @@ export class SetWatcher {
         const first = this.seen.get(key);
         if (first === undefined) {
           this.seen.set(key, now);
-          this.log("warn", "check", `position ${u.positionQty} does not cover Set ${u.setId}'s ${u.setsQty} while its exits are open (${source}); checking again before acting`, { symbol, setId: u.setId });
+          this.log("warn", "check", `position ${u.positionQty} does not cover Set ${u.setId}'s ${u.setsQty} while the Set is still open (${source}); checking again before acting`, { symbol, setId: u.setId });
         } else if (now - first >= this.graceMs) {
           confirmed.push(u.setId);
         }

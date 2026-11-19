@@ -30,9 +30,9 @@ describe("config", () => {
     expect(() => loadConfig({ ASTER_BUILDER_ADDRESS: A, ASTER_BUILDER_FEE_RATE: "0.01" })).toThrow(/at most/);
     expect(() => loadConfig({ ASTER_BASE_URL: "http://insecure" })).toThrow(/https/);
   });
-  it("ASTER_EXIT_REDUCE_ONLY defaults to false; only true or false are accepted (negative)", () => {
-    expect(loadConfig({}).reduceOnlyExits).toBe(false);
-    expect(loadConfig({ ASTER_EXIT_REDUCE_ONLY: "true" }).reduceOnlyExits).toBe(true);
+  it("ASTER_EXIT_REDUCE_ONLY defaults to true (proven live 2026-11-19); only true or false are accepted (negative)", () => {
+    expect(loadConfig({}).reduceOnlyExits).toBe(true);
+    expect(loadConfig({ ASTER_EXIT_REDUCE_ONLY: "false" }).reduceOnlyExits).toBe(false);
     expect(() => loadConfig({ ASTER_EXIT_REDUCE_ONLY: "yes" })).toThrow(/ASTER_EXIT_REDUCE_ONLY/);
   });
   it("never prints a secret value", () => {

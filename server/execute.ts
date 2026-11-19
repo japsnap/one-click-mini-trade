@@ -18,7 +18,7 @@
  *    `<setId>-<leg>`. The ledger records each Set's own fills.
  *  - The account's position mode and margin type are READ, never changed (Blackboard's
  *    own app owns them). One-way mode: exits are plain opposite-side orders of the Set's
- *    quantity; reduce-only only when the reduceOnlyExits option is on (default off, untested
+ *    quantity; reduce-only when the reduceOnlyExits option is on (the server's default since the live proof
  *    live). Hedge mode: positionSide LONG / SHORT per Set direction (reduceOnly is not allowed).
  *  - Exits are sized to the Set's FILLED quantity: the OTOCO places them at the planned
  *    quantity on the first fill, and syncSetExits resizes them (updateStrategyOrder) after
@@ -93,7 +93,7 @@ export interface SetLegs {
  * hedgeMode: the account's position mode (read with isHedgeMode, never changed).
  * setId: when given, every leg carries its Set client order id (live Sets always pass one).
  * opts.reduceOnlyExits: one-way mode only, marks both exits reduceOnly "true" (the V3 doc
- * lists reduceOnly on strategy sub-orders; untested live, so off unless the server's
+ * lists reduceOnly on strategy sub-orders; proven live 2026-11-19; on unless the server's
  * ASTER_EXIT_REDUCE_ONLY is "true").
  */
 export function planToSetLegs(plan: SetPlan, rules: SymbolRules, hedgeMode: boolean, setId?: string, opts: { reduceOnlyExits?: boolean } = {}): SetLegs[] {

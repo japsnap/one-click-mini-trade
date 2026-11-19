@@ -25,7 +25,7 @@ export interface ServerConfig {
   /** Present only when all three Aster credentials are set. */
   credentials: { user: Hex; signer: Hex; privateKey: Hex } | null;
   builder: BuilderConfig | null;
-  /** One-way mode: send both exits with reduceOnly "true" (ASTER_EXIT_REDUCE_ONLY, default false: untested live). */
+  /** One-way mode: send both exits with reduceOnly "true" (ASTER_EXIT_REDUCE_ONLY, default true since its live proof on 2026-11-19: Aster accepted it on both OTOCO exits and expired both itself when the position was closed by hand). */
   reduceOnlyExits: boolean;
 }
 
@@ -88,7 +88,7 @@ export function loadConfig(env: Record<string, string | undefined>): ServerConfi
     }
   }
 
-  const roRaw = (get("ASTER_EXIT_REDUCE_ONLY") ?? "false").toLowerCase();
+  const roRaw = (get("ASTER_EXIT_REDUCE_ONLY") ?? "true").toLowerCase();
   if (roRaw !== "true" && roRaw !== "false") throw new ConfigError('ASTER_EXIT_REDUCE_ONLY must be "true" or "false"');
 
   const portRaw = get("PORT") ?? "8787";

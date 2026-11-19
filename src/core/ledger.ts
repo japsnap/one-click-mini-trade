@@ -517,7 +517,7 @@ export function applyOrderUpdate(ledger0: SetLedger, u: OrderUpdate, now: number
     } else if ((order.state === "cancelled" || order.state === "expired" || order.state === "rejected") && !order.cancelRequested) {
       const explained = sibling.state === "filled" || legOpenQty(leg) <= 1e-12 || (filledQty(leg.entry) === 0 && isFinal(leg.entry));
       if (!explained) {
-        const msg = `${role} ${order.clientOrderId} was ${order.state} on the exchange while ${legOpenQty(leg)} is still open: this Set has lost an exit`;
+        const msg = `${role} ${order.clientOrderId} was ${order.state} on the exchange while the Set still counts ${legOpenQty(leg)} open: either the position was closed by hand (reduce-only exits expire then) or the Set has lost an exit; the watcher checks the position now`;
         set.needsAttention = msg;
         log.push({ level: "error", setId: set.id, message: msg });
         return finish(ledger, set, now, actions, log, true);
@@ -688,8 +688,9 @@ export function uncoveredSets(
       if (covered) continue;
       for (const s of mine) {
         if (key !== "BOTH" && (key === "LONG") !== (s.side === "buy")) continue;
-        const exitsWorking = s.legs.some((l) => legOpenQty(l) > 1e-12 && [l.takeProfit, l.stop].some((o) => !isFinal(o) && !o.cancelRequested));
-        if (exitsWorking) out.push({ setId: s.id, key, setsQty, positionQty });
+        // Included whether or not its exits still work: with reduce-only exits Aster expires
+        // both itself when the position is closed by hand, and the Set must still be closed.
+        out.push({ setId: s.id, key, setsQty, positionQty });
       }
     }
   }

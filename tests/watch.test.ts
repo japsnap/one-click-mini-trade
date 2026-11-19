@@ -71,7 +71,7 @@ function fakeAster(positionAmt: number) {
   const client = new AsterClient({ fetch, auth: { user: ("0x" + "a".repeat(40)) as `0x${string}`, signer: s.address, sign: s.sign } });
   const of = (method: string, path: string) => calls.filter((c) => c.method === method && c.path === path);
   const cancelled = () => of("DELETE", "/fapi/v3/order").map((c) => c.params.get("origClientOrderId"));
-  return { client, state, of, cancelled };
+  return { client, state, of, cancelled, calls };
 }
 
 /** The live ETH Set as the ledger knew it: sent, entry working, no fill recorded. */
@@ -256,5 +256,65 @@ describe("Watcher: stream and poll", () => {
     expect(store.current().sets[0]!.status).toBe("closed");
     await w.handleStreamMessage("{ not json");
     expect(logs.some((l) => l.level === "error" && /not JSON/.test(l.message))).toBe(true);
+  });
+});
+
+describe("Watcher: the backup poll asks Aster only while a Set is open", () => {
+  it("no open Set: a poll sends nothing to Aster (negative)", async () => {
+    const fake = fakeAster(0);
+    const { w } = watcher(fake, memoryLedgerStore(emptyLedger()));
+    const before = fake.calls.length;
+    await w.pollOnce();
+    await w.pollOnce(true);
+    expect(fake.calls.length).toBe(before);
+    expect(w.stats.polls).toBe(0);
+  });
+
+  it("exits not reduce-only: every 15 s tick asks Aster", async () => {
+    const fake = fakeAster(0.166);
+    const { w, clock } = watcher(fake);
+    await w.pollOnce();
+    clock.set(15_000);
+    await w.pollOnce();
+    expect(w.stats.polls).toBe(2);
+    expect(fake.of("GET", "/fapi/v3/positionRisk")).toHaveLength(2);
+  });
+
+  it("reduce-only exits: ticks inside 60 s ask nothing, the tick at 60 s asks; a forced poll always asks", async () => {
+    const fake = fakeAster(0.166);
+    const { w, clock } = watcher(fake, undefined, { reduceOnlyExits: true });
+    await w.pollOnce();
+    for (const t of [15_000, 30_000, 45_000]) {
+      clock.set(t);
+      await w.pollOnce();
+    }
+    expect(fake.of("GET", "/fapi/v3/positionRisk")).toHaveLength(1);
+    clock.set(60_000);
+    await w.pollOnce();
+    expect(fake.of("GET", "/fapi/v3/positionRisk")).toHaveLength(2);
+    clock.set(61_000);
+    await w.pollOnce(true);
+    expect(fake.of("GET", "/fapi/v3/positionRisk")).toHaveLength(3);
+  });
+});
+
+describe("Watcher: reduce-only exits expired by Aster after a hand close (live 2026-11-19 22:14 UTC)", () => {
+  it("the Set is closed outside the Set, nothing is cancelled or placed, and a stuck open Set no longer blocks the coin", async () => {
+    const fake = fakeAster(0.166);
+    const { w, store, clock } = watcher(fake);
+    await w.checkSymbol("ETHUSDT", "poll"); // catches up the entry fill; position covers the Set
+    expect(store.current().sets[0]!.status).toBe("open");
+    // Hand close: position goes to 0 and Aster expires both reduce-only exits itself.
+    fake.state.positionAmt = 0;
+    fake.state.orders.set(`${ID}-1S`, { status: "EXPIRED", executedQty: 0, avgPrice: 0, orderId: 3 });
+    fake.state.orders.set(`${ID}-1T`, { status: "EXPIRED", executedQty: 0, avgPrice: 0, orderId: 2 });
+    await w.handleStreamMessage(JSON.stringify({ e: "ORDER_TRADE_UPDATE", E: 3, o: { s: "ETHUSDT", c: `${ID}-1S`, i: 3, x: "EXPIRED", X: "EXPIRED", l: "0", z: "0", L: "0", n: "0", N: "USDT", t: 0, T: 3 } }));
+    await w.handleStreamMessage(JSON.stringify({ e: "ORDER_TRADE_UPDATE", E: 4, o: { s: "ETHUSDT", c: `${ID}-1T`, i: 2, x: "EXPIRED", X: "EXPIRED", l: "0", z: "0", L: "0", n: "0", N: "USDT", t: 0, T: 4 } }));
+    clock.set(6_000);
+    await w.checkSymbol("ETHUSDT", "poll");
+    const set = store.current().sets[0]!;
+    expect(set.status).toBe("closed-outside");
+    expect(fake.cancelled()).toEqual([]);
+    expect(fake.of("POST", "/fapi/v3/order")).toHaveLength(0);
   });
 });

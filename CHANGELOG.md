@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-11-20 (later): reduce-only exits proven live, quieter watcher
+
+- Live test, one $10 ETH Set at 30x (set_mwo3x09sj3ycx): entry 1,746.73, target 1,848.87 (in front of a $59k wall at 1,849.55), stop 1,701.42, both exits `reduceOnly: "true"`, accepted. Closed with an outside market order at 1,747.03 (what a hand close in Blackboard sends). Aster expired both exits itself; 0 open orders after. Result +$0.05 on price, $0.39 fees, so -$0.34.
+- Fix found by that test: once Aster expires the exits, the Set no longer had "exits working", so the watcher never closed it and never-merge would have blocked the coin. `uncoveredSets` now includes such Sets; replay test added (fails without the fix).
+- `ASTER_EXIT_REDUCE_ONLY` defaults to true. Watcher backup poll: asks Aster only while a Set is open; 15 s, or 60 s with reduce-only exits; start-up and stream reconnect still force a check. Three cadence tests.
+- Tests: 150 before, 154 after.
+
 ## 2026-11-20: never merge, the watcher, the rules window, a two-choice card
 
 - Never merge (owner's ruling): a new Set is refused when its coin already holds any position (his own or a Set's, either side) or a live Set; plain refusal text, nothing sent (`checkCoinIsFree` in `src/core/risk.ts`, `preTradeCheck`). The merge warning and the outside-baseline path for new Sets are gone; old ledgers with `outside` still reconcile. Margin, liquidation-shrink and stop checks stay (cross margin links coins).
