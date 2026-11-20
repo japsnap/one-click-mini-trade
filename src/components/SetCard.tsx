@@ -10,8 +10,8 @@
  * Nearby and Patient show "Checking traders' orders..." while the plan (which loads the
  * traders' levels) is fetched through TanStack Query, then the chosen price. When Patient
  * or Nearby falls back, the card itself says so (amber line), not only the sheet.
- * A refused preview (anti-chase guard) shows the server's sentence, one line each, and a button
- * that previews the other side from the server's hint; while the liquidation map is still
+ * A refused preview (anti-chase guard) shows the server's sentence, one line each, and no
+ * other-side suggestion (owner's ruling 2026-11-21); while the liquidation map is still
  * being read one line says how far it got. The 30 s refresh keeps the shown plan and Enter.
  * Draw swaps in the vertical price strip. After Enter: waiting/open status, progress bar
  * to take-profit, the halfway and result toasts, and the result with the fee split.
@@ -165,18 +165,11 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
         ) : preview.isError ? (
           <Warn>{(preview.error as Error).message}</Warn>
         ) : refusal ? (
-          <>
-            <Warn data-testid="refusal">
-              {refusal.message.split("\n").map((l, i) => (
-                <div key={i}>{l}</div>
-              ))}
-            </Warn>
-            {refusal.hint && (
-              <Opt $on={false} onClick={() => setSide(refusal.hint!.input.side)} data-testid="refusal-hint">
-                {refusal.hint.input.side === "buy" ? "Preview a Long instead" : "Preview a Short instead"}
-              </Opt>
-            )}
-          </>
+          <Warn data-testid="refusal">
+            {refusal.message.split("\n").map((l, i) => (
+              <div key={i}>{l}</div>
+            ))}
+          </Warn>
         ) : !drawReady ? (
           <Muted>Paint an In band and an Out band.</Muted>
         ) : plan ? (

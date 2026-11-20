@@ -58,9 +58,9 @@
   - 追いかけと判定するのは、Setのエントリー価格（Nearby、Patient、Drawでは指値の価格）が次の2つを両方満たすときです。
   - 1つ目。直近72時間の値幅（3%以上あるとき）のうち、自分の側の外側10%にある。
   - 2つ目。直近24時間の反対側の極値から、1日の典型的な値動きの1.5倍以上離れている。
-  - このとき、プレビューと発注は`"status": "refused: chasing"`と理由の文を返します。文は2行です。例えば"ETH fell 10.3% in a day, below its 3-day low."と"A Short here would follow the move at its edge."です。反対側をプレビューするヒントも返します。
-  - カードは、その2行と、ボタン「Preview a Long instead」または「Preview a Short instead」を表示します。
-  - Asterの1時間足を読めないときは判定できないので、そのSetも拒否します（`"status": "refused: guard unavailable"`、エラー内容付き、ボタンなし）。
+  - このとき、プレビューと発注は`"status": "refused: chasing"`と理由の文を返します。文は2行です。例えば"ETH fell 10.3% in a day, below its 3-day low."と"A Short here would follow the move at its edge."です。
+  - サーバーもカードも、反対側を勧めません（オーナーの判断、2026-11-21:「Avoid long instead. Saying that is risky.」）。カードはその2行だけを表示します。
+  - Asterの1時間足を読めないときは判定できないので、そのSetも拒否します（`"status": "refused: guard unavailable"`、エラー内容付き）。
 
 指値の価格はすべて、最大0.05%の範囲で無作為にずらします。多くのSetが同じ価格に重ならないようにするためです。乱数はすべて、外から渡す1つの乱数源から取ります。そのため、シードを決めれば同じSetを再現できます（テストはこれを使い、プレビューのルートは`"seed"`を受け付けます）。勝ったSetでは、利益の5%がBlackboardに、5%がコピー元のトレーダーに入ります。負けたSetは何も払いません。
 
@@ -130,8 +130,8 @@
   - 同じ乱数の選び方を繰り返すには、`"seed": 1`を加えます。
   - Drawでは`"draw":{"inBand":{"low":..,"high":..},"outBand":{"low":..,"high":..}}`を加えます。
   - 鍵が設定されていれば、ライブのチェックも行います。その拒否か警告を`check`として返します。
-  - 追いかけと判定すると、409で`"status": "refused: chasing"`を返します。理由の文は`message`に入り、`hint`も付きます（`label`は"preview a Long instead"、反対側の入力付き）。
-  - 1時間足を読めないときは、409で`"status": "refused: guard unavailable"`を返します。`hint`はnullです。
+  - 追いかけと判定すると、409で`"status": "refused: chasing"`を返します。理由の文は`message`に、判定の数値は`chase`に入ります。反対側は勧めません。
+  - 1時間足を読めないときは、409で`"status": "refused: guard unavailable"`を返します。
 - `POST /api/set/place`: ボディは同じです。上のとおり、トライアルかライブで動きます。トライアルの答えには、`setId`と、クライアント注文ID付きのレッグも入ります。ライブのSetを拒否したとき（その銘柄にポジションかSetがある、残高、清算のルール）は、409と分かりやすい`message`を返します。何も送っていません。
 - `GET /api/sets`: 台帳にあるすべてのSetを、状態と、そのSet自身の約定から出した利益付きで返します。各行には`headline`が付きます（"ETH Long from 1,805.73, sell 1,899.43 (1.97x), stop 1,758.19"）。
 - `GET /api/rules`: 有効なルールセットと、その読み込み元のファイル。
@@ -223,7 +223,7 @@ Blackboardが受け取るのは、この構成と、変更できる初期のル�
   - すべての注文イベントに、こちらのクライアント注文IDと`si`（strategyId）、`ss`（sub id）が付いていたこと。
   - Asterのゲートウェイは、エントリーのレッグに`firstDrivenId: "0"`と`secondDrivenId: "0"`を必要とします。ドキュメントでは任意となっています。
 - 目標v2の残り。
-  - 理由の文と見出しはプランと`GET /api/sets`に入っていますが、カードにはまだ表示していません。"1.97x against the real fill"、"reading the liquidation map"の行、追いかけ拒否の"preview a Long instead"ボタンも同じです（デザイナーと文言の作業です。サーバーはすでにこれらを返しています）。
+  - 理由の文と見出しはプランと`GET /api/sets`に入っていますが、カードにはまだ表示していません。"1.97x against the real fill"も同じです（デザイナーと文言の作業です。サーバーはすでにこれらを返しています）。
   - クラスターの最低額（$100,000）とブレーキのペナルティ（0.8）は、仮の初期値です。目標の結果が出たら、`logs/plans.jsonl`から調整します。
   - 清算マップは、1つの取引所のクジラだけを見ています。実際のクラスターの下限にあたり、ほとんどの帯はトレーダー1人分です。
 - 約定前のトライアルモードには、レバレッジブラケットがありません（署名付きの呼び出しが必要なためです）。そのため、維持証拠金率を0.5%と仮定します（ルール`risk.assumedMaintenanceRate`）。ライブモードは実際のブラケットを読みます。

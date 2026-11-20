@@ -18,14 +18,13 @@ export interface PreviewPlan {
 
 /**
  * A preview the server refused before anything was sent (HTTP 409): the anti-chase guard
- * ("refused: chasing", with a hint to preview the other side) or a guard that could not run
- * ("refused: guard unavailable", no hint). message is the sentence the card shows.
+ * ("refused: chasing") or a guard that could not run ("refused: guard unavailable"). message
+ * is the sentence the card shows. No other side is suggested (owner's ruling 2026-11-21).
  */
 export interface PreviewRefusal {
   refused: true;
   status: string;
   message: string;
-  hint: { label: string; input: SetInput } | null;
 }
 
 export type PreviewResponse = PreviewPlan | PreviewRefusal;
@@ -72,7 +71,7 @@ export const demoServerApi: SetCardApi = {
   async preview(input) {
     const res = await fetch("/api/set/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
     const body = (await res.json().catch(() => ({}))) as { error?: string; refused?: boolean };
-    // A refusal is an answer, not a failure: the card shows its sentence and the hint.
+    // A refusal is an answer, not a failure: the card shows its sentence.
     if (res.status === 409 && body.refused === true) return body as PreviewRefusal;
     if (!res.ok) throw new Error(body.error ?? `request failed: HTTP ${res.status}`);
     return body as PreviewPlan;

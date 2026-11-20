@@ -344,6 +344,28 @@ describe("target v2 (Sets_Rules.md E1)", () => {
     expect(dropped.counts).toMatchObject({ clustersFound: 0, clustersBelowSlackLine: 1 });
   });
 
+  it("(i, A11) a whale inside the slack line never vetoes a crowd in the window (review 2026-11-21)", () => {
+    // $50M of one account at 1,880 (1.56x, inside the 1.9x line) sits within 1.5% of a crowd of
+    // 3 accounts, $2.0M at 1,905 to 1,907. Grouped together the whale holds 96% and the whole
+    // group failed as "mostly one account", so the crowd the target is for was lost.
+    const levels = [short(1880, 50_000_000), short(1905, 800_000), short(1906, 700_000), short(1907, 500_000)];
+    const tp = pickTakeProfit({ ...base, liquidationLevels: levels });
+    expect(tp.source).toBe("liquidation-cluster");
+    expect(tp.price).toBe(1899.43); // in front of 1,900, which sits 0.26% in front of the crowd's edge
+    expect(tp.reason).toContain("$2.0M of 3 accounts' shorts get liquidated (1,905 to 1,907");
+    expect(tp.reason).not.toContain("$52M");
+    expect(tp.counts).toMatchObject({ clustersFound: 1, clustersWhaleOnly: 0 });
+    // Sell mirror: a whale's long at 1,731.46 (inside the line), a crowd of longs at 1,706.46 to 1,704.46.
+    const sell = { ...base, side: "sell" as const, stopPrice: 1853.27 };
+    const long = (price: number, weightUsd: number): LiquidationLevel => ({ price, weightUsd, positionSide: "long" });
+    const s = pickTakeProfit({ ...sell, liquidationLevels: [long(1731.46, 50_000_000), long(1706.46, 800_000), long(1705.46, 700_000), long(1704.46, 500_000)] });
+    expect(s.source).toBe("liquidation-cluster");
+    expect(s.reason).toContain("$2.0M of 3 accounts' longs get liquidated (1,706.46 to 1,704.46");
+    // A crowd that qualifies together with the inside-line level is kept whole (test (i) above).
+    const whole = pickTakeProfit({ ...base, liquidationLevels: [short(1890, 1_000_000), ...levels.slice(1)] });
+    expect(whole.reason).toContain("$3.0M of 4 accounts' shorts get liquidated (1,890 to 1,907");
+  });
+
   it("(j) realizedVol1h: alternating +-0.7% log returns give 0.0070; 10 closes give the floor and say too few candles", () => {
     const closes = [100];
     for (let i = 1; i < 73; i++) closes.push((closes[i - 1] as number) * Math.exp(i % 2 ? 0.007 : -0.007));

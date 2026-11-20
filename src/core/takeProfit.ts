@@ -557,6 +557,17 @@ export function collectTargetCandidates(args: {
     if (c.traders < t.fuelMinTraders) c.failed = "one account";
     else if (notionalUsd < t.fuelMinUsd) c.failed = "too small";
     else if (c.share > t.fuelMaxShare + 1e-12 || c.restUsd < t.fuelMinRestUsd) c.failed = "mostly one account";
+    // A group that starts inside the slack line and fails breadth: the levels inside the line are
+    // never a target, so they must not sink the crowd behind them. Group again from the first
+    // level at or past the line (review 2026-11-21: a $50M whale at 1.56x hid a 3-account crowd at 2x).
+    if (c.failed && d(first.price) < dLine) {
+      const start = i - members.length; // i already points past this group
+      const k = usable.findIndex((l, n) => n > start && n < i && d(l.price) >= dLine);
+      if (k > start) {
+        i = k;
+        continue;
+      }
+    }
     if (c.failed === "too small" || (c.failed === "one account" && notionalUsd < t.fuelMinUsd)) {
       tooSmall++;
       continue;

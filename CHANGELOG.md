@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-21 (evening): no other-side suggestion on a chase refusal, crowd-cluster fix, page snapshot
+
+- Owner's ruling on the anti-chase refusal: "Avoid long instead. Saying that is risky." The `hint` field is gone from the planner's refusal and from both 409 answers (preview and place); the card no longer shows "Preview a Long instead" or "Preview a Short instead", only the refusal's two lines. The chase edge stays at 10% (his ruling "GO with 10%"). README.md and README.ja.md updated. This replaces the hint described in the A12 line below.
+- Fixed (review of the cluster logic against Sets_Rules.md A, A10 to A13): a liquidation group that started inside the slack line and failed breadth swallowed the crowd behind it. Example: one account's $50M at 1.56x sat within 1.5% of three accounts' $2.0M at 2x; together the whale held 96%, the group failed as "mostly one account", and the target fell back to a round number. Such a group is now grouped again from its first level at or past the line, so the crowd counts; a group that qualifies as a whole is kept whole (test (i) unchanged). Test in `tests/core.test.ts`, Buy and Sell.
+- `scripts/snapshot-page.ts <out.json>` (new): page data for BTCUSDT from the real planner, trial mode, public data only. All 162 combinations (ticket 10/30/100, Buy/Sell, 30/50/100x, Shy/Deserved/Greedy, Now/Nearby/Patient) from one price, one book, one candles read, one trader read and the liquidation map read to all 600 accounts, then frozen; one seed per combination that leaves the ticket out, checked on the output (prices never move with the ticket). Run 2026-11-21 06:37 JST: 162 built, 0 refused, 0 ticket mismatches, map 600 of 600. Tests in `tests/snapshotPage.test.ts`.
+
 ## 2026-11-21 (later): on-demand liquidation map, crowd clusters, no chasing, Long/Short wording (spec Sets_Rules.md A10 to A13, build steps E8 to E11)
 
 - Why: Shota's three points after the live trial: the map was read on a timer forever ("these cluster should be found when the trade is made"); the targets used one-account "clusters" ("it can not be a one single trader"); "ETH sell: 1,667.52" read as selling at 1,667 when it was the Short's buy-back. Plus his hard rule against following a move at its edge.

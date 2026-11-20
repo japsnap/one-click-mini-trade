@@ -162,7 +162,6 @@ export function createPlanner(deps: PlannerDeps) {
       const refusal: PlanRefusal = {
         status: "refused: guard unavailable",
         message: `No Set now: the anti-chase check could not load Aster's hourly prices.\nError: ${error}`,
-        hint: null,
         chase: null,
       };
       warn(`[chase] ${input.symbol}: guard unavailable, refused: ${error}`);
@@ -172,12 +171,10 @@ export function createPlanner(deps: PlannerDeps) {
       const chase = chaseCheck(entry, input.side, candles.h1 as Kline[], candles.sigma1h ?? activeRules().target.volFloor, activeRules().chase, { asOf: now(), coin });
       sources.chase = chase;
       if (!chase.chase) return null;
-      const opposite = input.side === "buy" ? "sell" : "buy";
       log(`[chase] ${input.symbol} ${positionWords(input.side).position} from ${entry} refused: ${(chase.sentence as string).replace("\n", " ")}`);
       return {
         status: "refused: chasing",
         message: chase.sentence as string,
-        hint: { label: `preview a ${positionWords(opposite).position} instead`, input: { ...input, side: opposite } },
         chase,
       };
     };
@@ -262,13 +259,13 @@ export function createPlanner(deps: PlannerDeps) {
 }
 
 /**
- * A plan refused before anything is sent: by the anti-chase guard (A12; the card offers the
- * other side), or because the guard could not run (no candles; no hint, try again).
+ * A plan refused before anything is sent: by the anti-chase guard (A12), or because the guard
+ * could not run (no candles; try again). No other side is suggested (owner's ruling 2026-11-21:
+ * "Avoid long instead. Saying that is risky.").
  */
 export interface PlanRefusal {
   status: "refused: chasing" | "refused: guard unavailable";
   message: string;
-  hint: { label: string; input: SetInput } | null;
   chase: ChaseResult | null;
 }
 /** Kept for callers of the older name. */

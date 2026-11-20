@@ -13,7 +13,8 @@
  *   fast  the entry is at least daySigmas (1.5) typical days' moves (sigma1h x sqrt 24) beyond
  *         the last 24 hours' extreme on the other end (Short: below the 24-hour high; Long:
  *         above the 24-hour low).
- * Both: chase, the Set is refused (never flipped by itself: the opposite Set is the user's bet).
+ * Both: chase, the Set is refused. Never flipped and no other side suggested (owner's ruling
+ * 2026-11-21: "Avoid long instead. Saying that is risky.").
  * Pure: no network, no clock (asOf is passed in). No liquidation data needed.
  * Units: prices quote per base; shares are fractions (0.103 = 10.3%).
  */

@@ -133,7 +133,7 @@ describe("summary helpers", () => {
 describe("Set card: refusals, the map's progress, and the 30 s refresh (architect's review 2026-11-21)", () => {
   const planFor = (input: SetInput) => buildSetPlan({ input, currentPrice: 64000, rules: BTC, levels: LEVELS, random: () => 0.5 });
 
-  it("a refused Sell shows the refusal's two lines and a button that previews a Long; Enter stays off while refused", async () => {
+  it("a refused Sell shows the refusal's two lines and no other-side button (owner 2026-11-21: \"Avoid long instead\"); Enter stays off while refused", async () => {
     const previews: SetInput[] = [];
     const api: SetCardApi = {
       getPrice: async () => 64000,
@@ -144,7 +144,6 @@ describe("Set card: refusals, the map's progress, and the 30 s refresh (architec
             refused: true,
             status: "refused: chasing",
             message: "BTC fell 7.0% in a day, in the bottom 10% of its 3-day range.\nA Short here would follow the move at its edge.",
-            hint: { label: "preview a Long instead", input: { ...input, side: "buy" } },
           };
         }
         return { plan: planFor(input) };
@@ -162,8 +161,12 @@ describe("Set card: refusals, the map's progress, and the 30 s refresh (architec
       "A Short here would follow the move at its edge.",
     ]);
     expect((screen.getByRole("button", { name: /Enter Sell/ }) as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(screen.getByRole("button", { name: "Preview a Long instead" }));
-    // The hint switches the card to the other side (its Long plan was cached from the first preview).
+    // No suggestion of the other side anywhere on the card (negative).
+    expect(screen.queryByTestId("refusal-hint")).toBeNull();
+    expect(screen.queryByRole("button", { name: /instead/i })).toBeNull();
+    expect(document.body.textContent ?? "").not.toMatch(/instead|Preview a (Long|Short)/i);
+    // The user can still pick Buy themselves; the card then previews it normally.
+    fireEvent.click(screen.getByRole("button", { name: "Buy" }));
     await waitFor(() => expect(screen.queryByTestId("refusal")).toBeNull());
     expect(previews.some((p) => p.side === "buy")).toBe(true);
     await waitFor(() => expect((screen.getByRole("button", { name: /Enter Buy/ }) as HTMLButtonElement).disabled).toBe(false));
@@ -172,7 +175,7 @@ describe("Set card: refusals, the map's progress, and the 30 s refresh (architec
   it("a guard that could not run shows its lines and no button (negative)", async () => {
     const api: SetCardApi = {
       getPrice: async () => 64000,
-      preview: async () => ({ refused: true, status: "refused: guard unavailable", message: "No Set now: the anti-chase check could not load Aster's hourly prices.\nError: HTTP 503", hint: null }),
+      preview: async () => ({ refused: true, status: "refused: guard unavailable", message: "No Set now: the anti-chase check could not load Aster's hourly prices.\nError: HTTP 503" }),
       place: async () => {
         throw new Error("not used");
       },

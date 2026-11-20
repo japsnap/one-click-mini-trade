@@ -201,9 +201,9 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/set/preview") {
       const { plan, sources, refusal } = await planFromBody(await readJson(req), true);
       if (refusal) {
-        // Anti-chase guard (A12): refused before any map wait; the card offers the other side, never flips by itself.
+        // Anti-chase guard (A12): refused before any map wait; never flipped, no other side suggested.
         await logPlan("preview", plan, { status: refusal.status, refusal: refusal.message, sources: sourcesForLog(sources) });
-        return send(res, 409, { status: refusal.status, refused: true, error: refusal.message, message: refusal.message, hint: refusal.hint, chase: refusal.chase, sources });
+        return send(res, 409, { status: refusal.status, refused: true, error: refusal.message, message: refusal.message, chase: refusal.chase, sources });
       }
       const rules = await aster.getSymbolRules(plan.input.symbol);
       await logPlan("preview", plan, { sources: sourcesForLog(sources) });
@@ -223,7 +223,7 @@ const server = createServer(async (req, res) => {
       const { plan, sources, refusal } = await planFromBody(await readJson(req), false);
       if (refusal) {
         await logPlan("place", plan, { status: refusal.status, refusal: refusal.message, sources: sourcesForLog(sources) });
-        return send(res, 409, { status: refusal.status, refused: true, error: refusal.message, message: refusal.message, hint: refusal.hint, chase: refusal.chase, sources });
+        return send(res, 409, { status: refusal.status, refused: true, error: refusal.message, message: refusal.message, chase: refusal.chase, sources });
       }
       const rules = await aster.getSymbolRules(plan.input.symbol);
       // Three gates for a real order. Any one failing keeps it a trial.

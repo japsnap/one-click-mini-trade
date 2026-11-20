@@ -228,7 +228,8 @@ describe("preview with candles and the liquidation map (server/planning.ts)", ()
     const planner = createPlanner({ aster: broken, levels: cold, bracketsFor: async () => null, random: () => 0.5, log: (l) => lines.push(l), warn: (l) => lines.push(l) });
     for (const [side, allowSeed] of [["sell", true], ["sell", false], ["buy", false]] as const) {
       const out = await planner.planFromBody({ symbol: "ETHUSDT", side, ticketUsd: 10, leverage: 30, tpMode: "deserved", entryMode: "now" }, allowSeed);
-      expect(out.refusal).toMatchObject({ status: "refused: guard unavailable", hint: null, chase: null });
+      expect(out.refusal).toMatchObject({ status: "refused: guard unavailable", chase: null });
+      expect(out.refusal).not.toHaveProperty("hint");
       expect(out.refusal!.message.split("\n")[0]).toBe("No Set now: the anti-chase check could not load Aster's hourly prices.");
       expect(out.refusal!.message.split("\n")[1]).toMatch(/^Error: .*503.*Service Unavailable/); // names the klines error
       expect(out.sources.fuelMap).toBeNull(); // the map was never asked for
@@ -312,14 +313,15 @@ describe("planner: anti-chase refusal and the on-demand map (A10, A12)", () => {
   }
   const body = (side: "buy" | "sell") => ({ symbol: "ETHUSDT", side, ticketUsd: 10, leverage: 30, tpMode: "deserved", entryMode: "now" });
 
-  it("a Short at the 2026-11-21 edge is refused before the map is asked for; the hint previews a Long, never placed by itself", async () => {
+  it("a Short at the 2026-11-21 edge is refused before the map is asked for; no other side is suggested (owner 2026-11-21)", async () => {
     const { planner, calls, ensured, lines } = setup();
     const out = await planner.planFromBody(body("sell"), false);
     expect(out.refusal).toMatchObject({
       status: "refused: chasing",
       message: "ETH fell 10.3% in a day, below its 3-day low.\nA Short here would follow the move at its edge.",
-      hint: { label: "preview a Long instead", input: { side: "buy", symbol: "ETHUSDT", tpMode: "deserved", entryMode: "now" } },
     });
+    expect(out.refusal).not.toHaveProperty("hint");
+    expect(JSON.stringify(out.refusal)).not.toMatch(/instead/i);
     expect(ensured()).toBe(0);
     expect(calls).toHaveLength(0); // no Hyperliquid request for a refused Set
     expect(out.sources.chase).toMatchObject({ chase: true, edge: true, fast: true });
