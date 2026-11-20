@@ -6,6 +6,7 @@
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { FakeClock } from "./helpers/fakeClock";
 import {
   coinFromSymbol,
   HyperliquidLevelSource,
@@ -140,8 +141,13 @@ describe("HyperliquidLevelSource", () => {
     const b = await src.getLevels("BTC");
     expect(b.report.fromCache).toBe(true);
     expect(stats().infoCalls).toBe(callsAfterFirst);
-    now += 120_000; // caches expired; leaderboard (6 h) still cached
-    await src.getLevels("BTC");
+    now += 120_000; // since 2026-11-21 the trader sample is reused for 5 minutes (it costs about 944 weight)
+    const c = await src.getLevels("BTC");
+    expect(c.report).toMatchObject({ fromCache: true, ageMs: 130_000 });
+    expect(stats().infoCalls).toBe(callsAfterFirst);
+    now += 200_000; // 5 min 30 s: expired; leaderboard (6 h) still cached
+    const d = await src.getLevels("BTC");
+    expect(d.report).toMatchObject({ fromCache: false, ageMs: 0 });
     expect(stats().lbCalls).toBe(1);
     expect(stats().infoCalls).toBe(callsAfterFirst * 2);
   });
@@ -169,6 +175,26 @@ describe("HyperliquidLevelSource", () => {
     expect(stats().infoCalls).toBe(2);
     const none = new HyperliquidLevelSource({ fetch: f, log: () => undefined, minAccountValueUsd: 1, minAccountValueForVolumeUsd: 1, weightBudgetPerMinute: 1 });
     await expect(none.getLevels("BTC")).rejects.toThrow(/rate budget used up/);
+  });
+
+  it("a trader sample that lost more than 10% of its requests is reused for 60 s only; a clean one for 5 minutes", async () => {
+    let now = 1_000;
+    const clean = fakeFetch();
+    const ok = new HyperliquidLevelSource({ fetch: clean.f, now: () => now, log: () => undefined, minAccountValueUsd: 1, minAccountValueForVolumeUsd: 1 });
+    expect((await ok.getLevels("BTC")).report.cachedForMs).toBe(300_000);
+    const lossy = fakeFetch();
+    const bad = new HyperliquidLevelSource({ fetch: lossy.f, now: () => now, log: () => undefined, minAccountValueUsd: 1, minAccountValueForVolumeUsd: 1, weightBudgetPerMinute: 4 });
+    const first = await bad.getLevels("BTC");
+    expect(first.report.skippedByRateBudget).toBeGreaterThan(0.1 * (first.report.positionAddresses + first.report.orderAddresses));
+    expect(first.report.cachedForMs).toBe(60_000);
+    const okCalls = clean.stats().infoCalls;
+    const badCalls = lossy.stats().infoCalls;
+    now += 70_000;
+    expect((await ok.getLevels("BTC")).report.fromCache).toBe(true); // clean: still reused
+    expect(clean.stats().infoCalls).toBe(okCalls);
+    const again = await bad.getLevels("BTC"); // lossy: read again after 60 s
+    expect(again.report.fromCache).toBe(false);
+    expect(lossy.stats().infoCalls).toBeGreaterThan(badCalls);
   });
 
   it("ignores a disk cache written for another trader selection (the old 30-trader file)", async () => {
@@ -262,7 +288,7 @@ describe("liquidation map (fuel map)", () => {
     const { src, calls, lines, clock } = fuelFake();
     const before = src.getFuelLevels("BTC");
     expect(before.status).toBe("unavailable"); // nothing read yet: said, not an empty list passed off as "no clusters"
-    expect(before.note).toMatch(/not read yet/);
+    expect(before.note).toMatch(/no fresh answer \(nothing read yet\)/); // since A10 the map reads only when asked; nothing asked yet
     const r = await src.refreshFuelMap();
     expect(r).toMatchObject({ addressesInSample: 600, addressesAsked: 600, answered: 600, failed: 0, skippedByBudget: 0, weightSpent: 1200 });
     expect(calls).toHaveLength(600);
@@ -293,7 +319,8 @@ describe("liquidation map (fuel map)", () => {
     const stale = src.getFuelLevels("BTC");
     expect(stale.status).toBe("unavailable");
     expect(stale.levels).toHaveLength(0);
-    expect(stale.note).toMatch(/no fresh answer/);
+    expect(stale.note).toMatch(/stale: every answer is older than 15 minutes/);
+    expect(stale.report.stage).toBe("stale");
   });
 
   it("12 of 600 accounts answering is thin: unavailable, with the count in the note (negative)", async () => {
@@ -313,5 +340,135 @@ describe("liquidation map (fuel map)", () => {
     expect(f.status).toBe("unavailable");
     expect(f.note).toMatch(/off/);
     expect(f.report.enabled).toBe(false);
+  });
+});
+
+/**
+ * The on-demand liquidation map (Sets_Rules.md A10, build step E8). HYBRID: the real source
+ * against a FAKE fetch (a SYNTHETIC 700-row leaderboard, the captured clearinghouseState for
+ * every account) and a FAKE clock whose waits resolve only when the test moves time.
+ */
+describe("on-demand liquidation map (A10, E8)", () => {
+  const row = (i: number) => ({
+    ethAddress: "0x" + (i + 1).toString(16).padStart(40, "0"),
+    accountValue: "50000",
+    windowPerformances: [["month", { pnl: "900", roi: "0.01", vlm: String(1e9 - i * 1000) }]],
+  });
+  const LB700 = { leaderboardRows: Array.from({ length: 700 }, (_, i) => row(i)) };
+
+  function onDemand(opts: { hang?: boolean } = {}) {
+    const clock = new FakeClock();
+    const calls: number[] = []; // fake time of every clearinghouseState request
+    const f = async (url: string, init?: RequestInit) => {
+      if (url.includes("leaderboard")) return new Response(JSON.stringify(LB700));
+      calls.push(clock.now());
+      if (opts.hang) return new Promise<Response>(() => undefined); // never answers
+      return new Response(JSON.stringify(JSON.parse(String(init?.body)).type === "clearinghouseState" ? CS : OO));
+    };
+    const lines: Array<{ at: number; line: string }> = [];
+    const src = new HyperliquidLevelSource({
+      fetch: f,
+      now: clock.now,
+      sleep: clock.sleep,
+      log: (l) => lines.push({ at: clock.now(), line: l }),
+      fuelMap: { topN: 600, refreshMinutes: 5, quickN: 200, waitMs: 8000, ttlMinutes: 5, idleMinutes: 10 },
+    });
+    return { clock, calls, lines, src };
+  }
+
+  it("(a) building the source and 30 idle minutes send zero requests; server/index.ts never starts the map itself", async () => {
+    const { clock, calls, src } = onDemand();
+    await clock.advance(30 * 60_000);
+    expect(calls).toHaveLength(0);
+    expect(src.requestsSent()).toEqual({ leaderboard: 0, info: 0 });
+    const indexTs = readFileSync(new URL("../server/index.ts", import.meta.url), "utf8");
+    expect(indexTs).not.toMatch(/levelsSource\.startFuelMap\(/); // static check: no start at boot
+  });
+
+  it("(b) the first ask sends exactly 200 (the quick map) within the first 8 s; stage quick, fresh 200 of 600", async () => {
+    const { clock, calls, src } = onDemand();
+    const report = await src.ensureFuelMap();
+    expect(report.addressesInSample).toBe(600);
+    await clock.advance(7_999);
+    expect(calls.filter((t) => t < 8_000)).toHaveLength(200);
+    const f = src.getFuelLevels("ETH", 1805.73);
+    expect(f.report).toMatchObject({ stage: "quick", fresh: 200, addressesWithFreshAnswer: 200, addressesInSample: 600 });
+    expect(f.status).toBe("ok");
+    expect(f.reading).toBeNull();
+  });
+
+  it("(c) stage 2 never passes 500 weight in any rolling minute and ends with 600 fresh, in under 2 minutes", async () => {
+    const { clock, calls, lines, src } = onDemand();
+    await src.ensureFuelMap();
+    await clock.advance(3 * 60_000);
+    const end = lines.find((l) => l.line.includes("stage 2: asked 400, answered 400, failed 0, skipped by budget 0"));
+    expect(end).toBeDefined();
+    expect(end!.at).toBeLessThan(8_000 + 2 * 60_000);
+    const stage2 = calls.slice(200, 600); // requests 201 to 600: stage 2 (the next whole pass starts the moment it ends)
+    expect(stage2.every((t) => t >= 8_000 && t <= end!.at)).toBe(true);
+    for (const t0 of stage2) expect(stage2.filter((t) => t >= t0 && t < t0 + 60_000).length * 2).toBeLessThanOrEqual(500);
+    // Right after stage 2, before the next whole pass is far along: the full sample is fresh.
+    expect(src.getFuelLevels("BTC").report.stage).toBe("full");
+  });
+
+  it("(d) with 600 fresh and a 2-minute-old map, a second ask sends 0 requests", async () => {
+    const { clock, calls, src } = onDemand();
+    await src.ensureFuelMap();
+    await clock.advance(2 * 60_000 + 10_000); // stage 2 done at about 1:44
+    expect(src.getFuelLevels("ETH").report.fresh).toBe(600);
+    const before = calls.length;
+    await src.ensureFuelMap();
+    await clock.flush();
+    expect(calls.length).toBe(before);
+  });
+
+  it("an ask while stage 2 is still filling in (200 of 600 fresh) sends nothing more: the quick map is fresh and the loop runs (live finding 2026-11-21)", async () => {
+    const { clock, calls, src } = onDemand();
+    await src.ensureFuelMap();
+    await clock.advance(30_000); // stage 2 under way
+    const before = calls.length;
+    expect(src.getFuelLevels("ETH").report.fresh).toBeLessThan(300);
+    await src.ensureFuelMap();
+    await clock.flush();
+    expect(calls.length).toBe(before);
+  });
+
+  it("(e) 10 minutes without an ask stops the loop: no request in the next 30 fake minutes", async () => {
+    const { clock, calls, lines, src } = onDemand();
+    await src.ensureFuelMap();
+    await clock.advance(11 * 60_000);
+    expect(lines.some((l) => /idle for 10 min: reading stopped/.test(l.line))).toBe(true);
+    const n = calls.length;
+    await clock.advance(30 * 60_000);
+    expect(calls.length).toBe(n);
+    expect(calls.every((t) => t <= 10 * 60_000 + 1_000)).toBe(true);
+  });
+
+  it("(f) an ask at minute 16 (every answer stale) runs stage 1 again before answering", async () => {
+    const { clock, calls, src } = onDemand();
+    await src.ensureFuelMap();
+    await clock.advance(16 * 60_000 + 30 * 60_000); // loop idle at 10 min, answers past 15 min
+    expect(src.getFuelLevels("ETH").report.stage).toBe("stale");
+    expect(src.getFuelLevels("ETH").status).toBe("unavailable");
+    const before = calls.length;
+    await src.ensureFuelMap();
+    expect(calls.length - before).toBe(200);
+    expect(src.getFuelLevels("ETH").report).toMatchObject({ stage: "quick", fresh: 200 });
+  });
+
+  it("(g) a quick map that never answers: after 8 s the ask returns, the map is unavailable and says it is still reading", async () => {
+    const { clock, calls, src } = onDemand({ hang: true });
+    let done = false;
+    const p = src.ensureFuelMap().then(() => void (done = true));
+    await clock.flush();
+    expect(done).toBe(false);
+    expect(calls.length).toBe(6); // 6 in flight, none answered
+    await clock.advance(8_000);
+    await p;
+    expect(done).toBe(true);
+    const f = src.getFuelLevels("ETH");
+    expect(f.status).toBe("unavailable");
+    expect(f.reading).toBe("liquidation map: 0 of 600 accounts, still reading");
+    expect(f.report.stage).toBe("reading");
   });
 });

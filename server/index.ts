@@ -84,8 +84,9 @@ const aster = new AsterClient({
 
 // Hyperliquid levels, with the trimmed leaderboard cached on disk for 6 hours.
 // Trader sets and the rate budget use the source's defaults (src/levels/hyperliquid.ts);
-// the liquidation map (fuel map) for the target follows the rules and refreshes itself in
-// the background (public reads only, also in trial mode).
+// the liquidation map (fuel map) for the target follows the rules and is read only while a
+// card asks for it (A10: quick map on the first preview, stops after 10 idle minutes; trial
+// mode behaves exactly like live).
 const cacheFile = path.join(ROOT, ".cache", "hl-leaderboard.json");
 const levelsSource = new HyperliquidLevelSource({
   diskCache: {
@@ -95,7 +96,14 @@ const levelsSource = new HyperliquidLevelSource({
       await writeFile(cacheFile, t);
     },
   },
-  fuelMap: { topN: activeRules().target.fuelMapTopN, refreshMinutes: activeRules().target.fuelMapRefreshMinutes },
+  fuelMap: {
+    topN: activeRules().target.fuelMapTopN,
+    refreshMinutes: activeRules().target.fuelMapRefreshMinutes,
+    quickN: activeRules().target.fuelMapQuickN,
+    waitMs: activeRules().target.fuelMapWaitMs,
+    ttlMinutes: activeRules().target.fuelMapTtlMinutes,
+    idleMinutes: activeRules().target.fuelMapIdleMinutes,
+  },
 });
 
 /** The Set ledger of this server's one account (server/ledgerFile.ts). */
@@ -155,7 +163,8 @@ const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://localhost");
   try {
     if (req.method === "GET" && url.pathname === "/api/health") {
-      return send(res, 200, { mode: cfg.liveTrading ? "live" : "trial", config: describeConfig(cfg) });
+      // hyperliquidRequests: requests sent so far; 0 until the first preview, level read or place (A10).
+      return send(res, 200, { mode: cfg.liveTrading ? "live" : "trial", config: describeConfig(cfg), hyperliquidRequests: levelsSource.requestsSent() });
     }
     if (req.method === "GET" && url.pathname === "/api/rules") {
       return send(res, 200, { source: loadedRules.source, rules: loadedRules.rules });
@@ -172,6 +181,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/levels") {
       const coin = (url.searchParams.get("coin") ?? "BTC").toUpperCase();
       if (!/^[A-Z0-9]{1,15}$/.test(coin)) return send(res, 400, { error: "coin must look like BTC" });
+      levelsSource.ensureFuelMap({ wait: false }).catch(() => undefined); // asking for levels starts the map (A10), without waiting
       const { levels, report } = await levelsSource.getLevels(coin);
       // The liquidation map's counts around the current price (read from memory, no request to Hyperliquid).
       const price = await aster.getPrice(`${coin}USDT`).then((p) => p.price).catch(() => undefined);
@@ -189,7 +199,12 @@ const server = createServer(async (req, res) => {
       });
     }
     if (req.method === "POST" && url.pathname === "/api/set/preview") {
-      const { plan, sources } = await planFromBody(await readJson(req), true);
+      const { plan, sources, refusal } = await planFromBody(await readJson(req), true);
+      if (refusal) {
+        // Anti-chase guard (A12): refused before any map wait; the card offers the other side, never flips by itself.
+        await logPlan("preview", plan, { status: refusal.status, refusal: refusal.message, sources: sourcesForLog(sources) });
+        return send(res, 409, { status: refusal.status, refused: true, error: refusal.message, message: refusal.message, hint: refusal.hint, chase: refusal.chase, sources });
+      }
       const rules = await aster.getSymbolRules(plan.input.symbol);
       await logPlan("preview", plan, { sources: sourcesForLog(sources) });
       // With keys set, run the same read-only checks a live Set must pass, so the card can
@@ -205,7 +220,11 @@ const server = createServer(async (req, res) => {
       return send(res, 200, { plan, sources, check, asterOrders: planToSetLegs(plan, rules, false, undefined, { reduceOnlyExits: cfg.reduceOnlyExits }) });
     }
     if (req.method === "POST" && url.pathname === "/api/set/place") {
-      const { plan, sources } = await planFromBody(await readJson(req), false);
+      const { plan, sources, refusal } = await planFromBody(await readJson(req), false);
+      if (refusal) {
+        await logPlan("place", plan, { status: refusal.status, refusal: refusal.message, sources: sourcesForLog(sources) });
+        return send(res, 409, { status: refusal.status, refused: true, error: refusal.message, message: refusal.message, hint: refusal.hint, chase: refusal.chase, sources });
+      }
       const rules = await aster.getSymbolRules(plan.input.symbol);
       // Three gates for a real order. Any one failing keeps it a trial.
       const why: string[] = [];
@@ -259,7 +278,7 @@ if (cfg.liveTrading && cfg.credentials) {
   const watcher = new SetWatcher({ client: aster, store: ledgerStore, reduceOnlyExits: cfg.reduceOnlyExits, log: fileWatchLog(path.join(ROOT, "logs", "watch.jsonl")) });
   await watcher.start();
 }
-levelsSource.startFuelMap();
+// The liquidation map is NOT started here (A10): it starts on the first preview, level read or place.
 server.listen(cfg.port, "127.0.0.1", () => {
   console.log(`[server] http://127.0.0.1:${cfg.port} ${describeConfig(cfg)}`);
 });

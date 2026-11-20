@@ -721,7 +721,7 @@ describe("Target against the real fill (A7, HYBRID)", () => {
     expect(after.target!.realRatio).toBeCloseTo((1899.43 - 1808.73) / (1808.73 - 1758.67), 6); // 1.812
     expect(after.target!.pendingPrice).toBe(1949.41);
     expect(after.target!.lastCheck).toBe(
-      "kept, update unproven: target 1,899.43 is 1.81x against the real fill, below 1.9x; re-chosen: no liquidation cluster between 1.9x and 4x, so target 1,949.41, just in front of 1,950 (a round number), 2.81x the stop",
+      "kept, update unproven: take profit (sell) at 1,899.43 is 1.81x against the real fill, below 1.9x; re-chosen: Long from 1,808.73; take profit (sell) at 1,949.41, 2.81x the stop (sell at 1,758.67): no liquidation cluster between 1.9x and 4x, so the sale sits just in front of 1,950 (a round number)",
     );
     expect(out.log.some((l) => l.level === "warn" && l.message.includes("kept, update unproven") && l.message.includes("would re-place at 1949.41"))).toBe(true);
     expect(tpBodies(fake)).toHaveLength(0);

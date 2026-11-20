@@ -10,6 +10,9 @@
  * Nearby and Patient show "Checking traders' orders..." while the plan (which loads the
  * traders' levels) is fetched through TanStack Query, then the chosen price. When Patient
  * or Nearby falls back, the card itself says so (amber line), not only the sheet.
+ * A refused preview (anti-chase guard) shows the server's sentence, one line each, and a button
+ * that previews the other side from the server's hint; while the liquidation map is still
+ * being read one line says how far it got. The 30 s refresh keeps the shown plan and Enter.
  * Draw swaps in the vertical price strip. After Enter: waiting/open status, progress bar
  * to take-profit, the halfway and result toasts, and the result with the fee split.
  *
@@ -25,7 +28,7 @@ import { activeRules, type SetRules } from "../rules/rules";
 import type { SetAlertEvent } from "../core/alerts";
 import { estimateLiquidationPrice } from "../core/liquidation";
 import type { DrawBands, EntryMode, Leverage, SetInput, Side, TicketUsd, TpMode } from "../core/types";
-import type { SetCardApi } from "../api/client";
+import { isRefusal, type SetCardApi } from "../api/client";
 import { theme } from "../theme";
 import { PriceStrip } from "./PriceStrip";
 import { SetOptionsSheet } from "./SetOptionsSheet";
@@ -39,6 +42,9 @@ export interface SetCardProps {
   onAlert?(e: SetAlertEvent): void;
 }
 
+
+/** How often an open card asks for a new preview (A10). Units: milliseconds. */
+export const PREVIEW_REFRESH_MS = 30_000;
 export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
   const fetchedRules = useQuery({ queryKey: ["set-rules"], queryFn: () => api.getRules!(), enabled: !!api.getRules, staleTime: Infinity, retry: false });
   const rules: SetRules = fetchedRules.data ?? activeRules();
@@ -74,6 +80,9 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
     queryFn: () => api.preview(input),
     enabled: drawReady,
     staleTime: 15_000,
+    // While the card is open it asks for a new plan every 30 s, so the liquidation map's full read
+    // (it starts on the first preview and finishes within 2 minutes) reaches the target (Sets_Rules.md A10).
+    refetchInterval: PREVIEW_REFRESH_MS,
     retry: false,
   });
 
@@ -83,10 +92,18 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
   // Draw strip shows about five liquidation distances either side of the price.
   const range = price.data ? { low: price.data * (1 - 5 / leverage), high: price.data * (1 + 5 / leverage) } : null;
   const inMid = bands.inBand ? (bands.inBand.low + bands.inBand.high) / 2 : undefined;
-  const plan = preview.data?.plan;
-  const loadingLevels = preview.isFetching && (entryMode === "nearby" || entryMode === "patient");
-  const line = optionsLine(leverage, preview.isFetching ? null : plan);
-  const notice = preview.isFetching ? null : fallbackNotice(plan);
+  // A refused preview (anti-chase guard) is an answer: its sentence and, when given, the other side.
+  const refusal = isRefusal(preview.data) ? preview.data : null;
+  const planned = preview.data && !isRefusal(preview.data) ? preview.data : null;
+  const plan = planned?.plan;
+  // Only the first load of these choices counts as loading: the 30 s refresh keeps the shown plan,
+  // the options line and the Enter button as they are until the new plan arrives.
+  const firstLoad = preview.isPending;
+  const loadingLevels = firstLoad && (entryMode === "nearby" || entryMode === "patient");
+  const line = optionsLine(leverage, firstLoad ? null : (plan ?? null));
+  const notice = firstLoad ? null : fallbackNotice(plan);
+  const map = planned?.sources?.fuelMap;
+  const mapReading = map && (map.stage === "reading" || map.stage === "quick") ? `Reading the liquidation map (${map.addressesWithFreshAnswer} of ${map.addressesInSample})` : null;
 
   return (
     <Card>
@@ -147,10 +164,28 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
           </Muted>
         ) : preview.isError ? (
           <Warn>{(preview.error as Error).message}</Warn>
+        ) : refusal ? (
+          <>
+            <Warn data-testid="refusal">
+              {refusal.message.split("\n").map((l, i) => (
+                <div key={i}>{l}</div>
+              ))}
+            </Warn>
+            {refusal.hint && (
+              <Opt $on={false} onClick={() => setSide(refusal.hint!.input.side)} data-testid="refusal-hint">
+                {refusal.hint.input.side === "buy" ? "Preview a Long instead" : "Preview a Short instead"}
+              </Opt>
+            )}
+          </>
         ) : !drawReady ? (
           <Muted>Paint an In band and an Out band.</Muted>
         ) : plan ? (
           <>
+            {mapReading && (
+              <Muted data-testid="map-reading">
+                <Spin size={14} /> {mapReading}
+              </Muted>
+            )}
             <Kv k="Entry" v={plan.entry.usedMode === "now" ? `market ~${px(plan.entry.expectedFillPrice)}` : px(plan.entry.expectedFillPrice)} />
             <Kv k="Orders" v={`${plan.orders.entries.length} in / ${plan.orders.takeProfits.length} out / ${plan.orders.stops.length} stop`} />
             <Kv k="Take-profit" v={`${px(plan.takeProfit.price)} (${plan.takeProfit.ratio.toFixed(2)}x)`} tone={theme.color.success} />
@@ -163,7 +198,7 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
         )}
       </PlanBox>
 
-      <Enter disabled={!plan || place.isPending || preview.isFetching} onClick={() => place.mutate()} $side={side}>
+      <Enter disabled={!plan || place.isPending || preview.isPending} onClick={() => place.mutate()} $side={side}>
         {place.isPending ? <Spin size={18} /> : `Enter ${side === "buy" ? "Buy" : "Sell"} $${ticketUsd}`}
       </Enter>
 

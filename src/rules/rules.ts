@@ -23,6 +23,7 @@ type Check =
   | { kind: "numberList"; min: number; max: number; integer?: boolean }
   | { kind: "stringList"; pattern: RegExp }
   | { kind: "oneOf"; values: readonly string[] }
+  | { kind: "boolean" }
   /** An object of named numbers ({"shy": 24, ...}); an override may give only some of the names. */
   | { kind: "numberMap"; keys: readonly string[]; min: number; max: number; integer?: boolean }
   /** An old key, still accepted for one release so an override file keyed to it loads; its value is ignored. */
@@ -46,13 +47,19 @@ const SCHEMA: Record<string, Check> = {
   "target.volLookbackHours": { kind: "number", min: 2, max: 1000, integer: true },
   "target.volFloor": fraction(0.1),
   "target.minReach": { kind: "number", min: 0, max: 0.5 },
-  "target.fuelBandWidth": fraction(0.05),
-  "target.fuelMaxBands": { kind: "number", min: 1, max: 50, integer: true },
   "target.fuelMinUsd": { kind: "number", min: 0, max: 1e10 },
+  "target.fuelClusterWidth": { kind: "number", min: 0.001, max: 0.05 },
+  "target.fuelMinTraders": { kind: "number", min: 1, max: 20, integer: true },
+  "target.fuelMaxShare": { kind: "number", min: 0.5, max: 1 },
+  "target.fuelMinRestUsd": { kind: "number", min: 0, max: 1e10 },
   "target.fuelInset": { kind: "number", min: 0, max: 0.05 },
   "target.fuelDensityBonus": { kind: "number", min: 0, max: 2 },
   "target.fuelMapTopN": { kind: "number", min: 0, max: 2000, integer: true },
   "target.fuelMapRefreshMinutes": { kind: "number", min: 1, max: 1440 },
+  "target.fuelMapQuickN": { kind: "number", min: 0, max: 2000, integer: true }, // and at most fuelMapTopN (checkConsistency)
+  "target.fuelMapWaitMs": { kind: "number", min: 0, max: 30_000 },
+  "target.fuelMapTtlMinutes": { kind: "number", min: 1, max: 60 },
+  "target.fuelMapIdleMinutes": { kind: "number", min: 1, max: 1440 },
   "target.brakeWeight": { kind: "number", min: 0, max: 10 },
   "target.brakePass": { kind: "number", min: 0, max: 1 },
   "target.brakeShadow": { kind: "number", min: 0, max: 0.05 },
@@ -65,6 +72,13 @@ const SCHEMA: Record<string, Check> = {
   // Old keys of the v1 target (wall search, round-number snap), retired 2026-11-20 by the v2 target.
   "target.wallSearchReach": { kind: "deprecated", replacedBy: "target.windowTop" },
   "target.roundNumberReach": { kind: "deprecated", replacedBy: "target.windowTop" },
+  // Old keys of the 0.1% band clusters, retired 2026-11-21 by the 1.5% breadth clusters (A11).
+  "target.fuelBandWidth": { kind: "deprecated", replacedBy: "target.fuelClusterWidth" },
+  "target.fuelMaxBands": { kind: "deprecated", replacedBy: "target.fuelClusterWidth" },
+  "chase.enabled": { kind: "boolean" },
+  "chase.edgeShare": { kind: "number", min: 0, max: 0.5 },
+  "chase.minRange": { kind: "number", min: 0, max: 0.5 },
+  "chase.daySigmas": { kind: "number", min: 0, max: 5 },
   "entry.default": { kind: "oneOf", values: ["now", "nearby", "patient", "draw"] },
   "entry.nudge": { kind: "number", min: 0, max: 0.01 },
   "entry.nearbyMinDistance": { kind: "number", min: 0, max: 0.1 },
@@ -114,6 +128,8 @@ function checkLeaf(key: string, v: unknown, c: Check): void {
         throw new RulesError(`rule "${key}.${name}": must be a number from ${c.min} to ${c.max}${c.integer ? ", a whole number" : ""} (got ${JSON.stringify(x)})`);
       }
     }
+  } else if (c.kind === "boolean") {
+    if (typeof v !== "boolean") throw bad("must be true or false");
   } else if (c.kind === "deprecated") {
     // Accepted and ignored; the server's loader names it so the owner can remove it.
     if (typeof v !== "number") throw bad("must be a number (the key is no longer used)");
@@ -176,6 +192,7 @@ function checkConsistency(r: SetRules): void {
     throw new RulesError(m);
   };
   if (!(r.target.shy <= r.target.deserved && r.target.deserved <= r.target.greedy)) fail('rules "target.shy", "target.deserved", "target.greedy" must not decrease');
+  if (!(r.target.fuelMapQuickN <= r.target.fuelMapTopN)) fail('rule "target.fuelMapQuickN" must not be above "target.fuelMapTopN"');
   if (!r.ticket.choices.includes(r.ticket.default)) fail(`rule "ticket.default" (${r.ticket.default}) must be one of "ticket.choices"`);
   if (!r.leverage.choices.includes(r.leverage.default)) fail(`rule "leverage.default" (${r.leverage.default}) must be one of "leverage.choices"`);
   if (!(r.entry.nearbyMinDistance < r.entry.nearbyMaxDistance)) fail('rule "entry.nearbyMinDistance" must be below "entry.nearbyMaxDistance"');

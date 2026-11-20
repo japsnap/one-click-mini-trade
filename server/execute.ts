@@ -45,7 +45,7 @@ import type { SymbolRules } from "../src/core/types";
 import { activeRules } from "../src/rules/rules";
 import { checkCoinIsFree, checkNewSetRisk, parseAccountRisk, type RiskVerdict } from "../src/core/risk";
 import { formatToStep, isOnStep } from "../src/core/rounding";
-import { cleanRatio, remeasureAfterFill } from "../src/core/takeProfit";
+import { cleanRatio, planHeadline, remeasureAfterFill } from "../src/core/takeProfit";
 import {
   activeSets,
   applyOrderUpdate,
@@ -684,8 +684,21 @@ export function describeLedger(ledger: SetLedger) {
     status: s.status,
     needsAttention: s.needsAttention,
     pnl: setPnl(s),
+    headline: setHeadline(s),
     target: describeTarget(s),
   }));
+}
+
+/** The A13 headline of a recorded single-entry Set, from its real fill when there is one: "ETH Long from 1,805.73, sell 1,899.43 (1.97x), stop 1,758.19". */
+export function setHeadline(s: SetRecord): string | null {
+  if (s.legs.length !== 1) return null;
+  const leg = s.legs[0] as SetLeg;
+  const fill = averagePrice(leg.entry);
+  const entry = fill > 0 ? fill : leg.plannedPrice;
+  if (!entry || !(entry > 0)) return null;
+  const dist = Math.abs(entry - leg.stop.stopPrice);
+  if (!(dist > 0)) return null;
+  return planHeadline({ symbol: s.symbol, side: s.side, entry, takeProfit: leg.takeProfit.stopPrice, ratio: Math.abs(leg.takeProfit.stopPrice - entry) / dist, stop: leg.stop.stopPrice });
 }
 
 /**

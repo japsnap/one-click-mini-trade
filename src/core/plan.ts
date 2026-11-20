@@ -49,7 +49,7 @@ export interface PlanMarket {
   swingHighs?: number[];
   swingLows?: number[];
   /** The liquidation map. status "unavailable" when it could not be read (the reason says so). */
-  fuel?: { levels: LiquidationLevel[]; status: "ok" | "unavailable"; note?: string | null };
+  fuel?: { levels: LiquidationLevel[]; status: "ok" | "unavailable"; note?: string | null; reading?: string | null };
 }
 
 /** One entry order. price is null for a market order. Units: quote per base; qty base. */
@@ -115,6 +115,8 @@ export interface SetPlan {
     counts: TargetCounts | null;
     /** What the Set keeps to choose again against the real fill (A7). null for Draw. */
     basis: TargetBasis | null;
+    /** A cluster that failed breadth (A11) but outscored the winner (named in the reason). */
+    wouldHaveWon?: ScoredCandidate | null;
   };
   expected: {
     /** Profit if every take-profit fills, before exchange fees. USD. */
@@ -276,6 +278,7 @@ export function buildSetPlan(args: {
     liquidationLevels: m.fuel ? m.fuel.levels : levels.liquidationLevels,
     fuelMap: m.fuel?.status ?? "ok",
     fuelMapNote: m.fuel?.note ?? null,
+    fuelMapReading: m.fuel?.reading ?? null,
     sigmaFloored: m.sigmaFloored,
     swingHighs: (input.side === "buy" ? m.swingHighs : m.swingLows) ?? [],
     sigma1h: m.sigma1h ?? null,
@@ -308,7 +311,7 @@ export function buildSetPlan(args: {
       maintenanceMarginRate: stop.maintenanceMarginRate,
       maintenanceSource: stop.maintenanceSource,
     },
-    takeProfit: { price: tp.price, ratio: tp.ratio, source: tp.source, reason: tp.reason, candidates: tp.candidates, counts: tp.counts, basis: tp.basis },
+    takeProfit: { price: tp.price, ratio: tp.ratio, source: tp.source, reason: tp.reason, candidates: tp.candidates, counts: tp.counts, basis: tp.basis, wouldHaveWon: tp.wouldHaveWon ?? null },
     expected: {
       profitAtTpUsd: profit,
       lossAtStopUsd: -round2(qty * stop.riskDistance),
@@ -394,8 +397,10 @@ export function withSymbolLeverage(plan: SetPlan, rules: SymbolRules, symbolLeve
       sigma1h: basis.sigma1h,
       fuelMap: basis.fuelMap,
       fuelMapNote: plan.takeProfit.counts?.fuelMapNote ?? null,
+      fuelMapReading: plan.takeProfit.counts?.fuelMapReading ?? null,
       minRatioOverride: basis.floor,
       collected: plan.takeProfit.counts ?? undefined,
+      rejected: basis.rejected,
     });
     takeProfits = [{ stopPrice: pick.price, qty: (plan.orders.takeProfits[0] as PlannedTrigger).qty }];
     takeProfit = {
@@ -406,6 +411,7 @@ export function withSymbolLeverage(plan: SetPlan, rules: SymbolRules, symbolLeve
       candidates: pick.candidates,
       counts: pick.counts,
       basis: pick.basis,
+      wouldHaveWon: pick.wouldHaveWon ?? null,
     };
     profitAtTpUsd = round2(e.qty * Math.abs(pick.price - entry));
   }

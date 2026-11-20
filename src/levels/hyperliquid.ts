@@ -254,6 +254,10 @@ export interface LevelsReport {
   /** Request weight spent by this fetch (Hyperliquid counts 1,200 per minute per IP). */
   weightSpent: number;
   fromCache: boolean;
+  /** How old the trader sample is, in ms (0 for a fresh read). */
+  ageMs: number;
+  /** How long this sample is reused: 5 minutes, or 60 s when more than 10% of its requests were lost. */
+  cachedForMs?: number;
 }
 
 /** Options for HyperliquidLevelSource. */
@@ -269,8 +273,14 @@ export interface HyperliquidSourceOptions extends Partial<TraderSelectionOptions
   leaderboardTimeoutMs?: number;
   /** How long the leaderboard stays fresh in ms. Default 6 hours. */
   leaderboardTtlMs?: number;
-  /** How long one coin's levels, and one address's answers, stay fresh in ms. Default 60 s. */
+  /** How long one address's answer stays in the per-address cache in ms. Default 60 s. */
   levelsTtlMs?: number;
+  /**
+   * How long one coin's trader sample (positions and resting orders of the kept traders) is
+   * reused in ms. Default 5 minutes (decision of 2026-11-21: a fresh read costs about 944 weight,
+   * most of the per-minute budget, and starved the liquidation map when re-read every minute).
+   */
+  traderSampleTtlMs?: number;
   /**
    * Request weight allowed per rolling minute. Default 1,100, under Hyperliquid's 1,200
    * per IP. Weights from Hyperliquid's docs: clearinghouseState 2, frontendOpenOrders 20.
@@ -288,7 +298,16 @@ export interface HyperliquidSourceOptions extends Partial<TraderSelectionOptions
    * minAccountValueUsd (default $10,000), read every refreshMinutes. topN 0 turns it off.
    * Default off here; the server passes the rules (target.fuelMapTopN, fuelMapRefreshMinutes).
    */
-  fuelMap?: { topN: number; refreshMinutes: number; minAccountValueUsd?: number };
+  fuelMap?: {
+    topN: number;
+    refreshMinutes: number;
+    minAccountValueUsd?: number;
+    /** Quick map size (stage 1), the longest a plan waits for it, answer freshness, idle stop (A10). */
+    quickN?: number;
+    waitMs?: number;
+    ttlMinutes?: number;
+    idleMinutes?: number;
+  };
   /** Wait function used to spread the fuel-map requests; injected for tests. Default setTimeout. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -314,13 +333,24 @@ export interface FuelMapReport {
   lastError: string | null;
 }
 
+/** How far the map got: see getFuelLevels. */
+export type FuelMapStage = "none" | "reading" | "quick" | "full" | "stale";
+
+/** Stage 2 of the quick start reads at most this much weight a minute (A10: 250 accounts a minute). */
+export const FUEL_STAGE2_WEIGHT_PER_MINUTE = 500;
+
 /** The liquidation map for one coin, with counts around a price. */
 export interface FuelLevels {
   levels: LiquidationLevel[];
   status: "ok" | "unavailable";
   /** Why it is unavailable, when it is. */
   note: string | null;
+  /** While the quick map is still being read: "liquidation map: 143 of 600 accounts, still reading". */
+  reading: string | null;
   report: FuelMapReport & {
+    stage: FuelMapStage;
+    /** Accounts answered within fuelMapTtlMinutes (5). addressesWithFreshAnswer counts those usable (15 minutes). */
+    fresh: number;
     coin: string;
     liquidationLevels: number;
     /** Around `price` (when given): shorts liquidated above, longs below, non-empty 0.1% bands within 20%. */
@@ -385,23 +415,31 @@ export class HyperliquidLevelSource {
     leaderboardTimeoutMs: number;
     leaderboardTtlMs: number;
     levelsTtlMs: number;
+    traderSampleTtlMs: number;
     weightBudgetPerMinute: number;
     now: () => number;
     log: (line: string) => void;
     diskCache?: HyperliquidSourceOptions["diskCache"];
   };
   private leaderboard: { at: number; traders: LeaderboardTrader[]; fuelTraders: LeaderboardTrader[] } | null = null;
-  private readonly fuel: { topN: number; refreshMs: number; minAccountValueUsd: number };
+  private readonly fuel: { topN: number; refreshMs: number; minAccountValueUsd: number; quickN: number; waitMs: number; ttlMs: number; idleMs: number };
   private readonly sleep: (ms: number) => Promise<void>;
   /** The latest answer of every fuel-map account: its liquidation levels per coin. */
   private readonly fuelAnswers = new Map<string, { at: number; byCoin: Map<string, LiquidationLevel[]> }>();
   private fuelReport: FuelMapReport;
   private fuelRun: Promise<FuelMapReport> | null = null;
-  private fuelTimer: ReturnType<typeof setTimeout> | null = null;
-  private fuelStopped = true;
   private fuelStopRequested = false;
+  /** The quick map (stage 1) while it runs, and when it started. */
+  private stage1Run: Promise<void> | null = null;
+  private stage1StartedAt: number | null = null;
+  /** The open-card loop is running. */
+  private looping = false;
+  /** Last time a preview, level read or place asked for the map (null: never). */
+  private lastTouchAt: number | null = null;
+  /** Requests sent to Hyperliquid, counted for the health check ("nothing before the first preview"). */
+  private readonly sent = { leaderboard: 0, info: 0 };
   private leaderboardInFlight: Promise<LeaderboardTrader[]> | null = null;
-  private readonly coinCache = new Map<string, { at: number; levels: TraderLevels; report: LevelsReport }>();
+  private readonly coinCache = new Map<string, { at: number; ttlMs: number; levels: TraderLevels; report: LevelsReport }>();
   /** Per-address answers ("clearinghouseState:0xabc"), shared by every coin. */
   private readonly answerCache = new Map<string, { at: number; json: unknown }>();
   /** Weight spent in the last minute, as (time, weight) pairs. */
@@ -422,17 +460,24 @@ export class HyperliquidLevelSource {
       leaderboardTimeoutMs: opts.leaderboardTimeoutMs ?? 90_000,
       leaderboardTtlMs: opts.leaderboardTtlMs ?? 6 * 60 * 60 * 1000,
       levelsTtlMs: opts.levelsTtlMs ?? 60_000,
+      traderSampleTtlMs: opts.traderSampleTtlMs ?? 5 * 60_000,
       weightBudgetPerMinute: opts.weightBudgetPerMinute ?? 1_100,
       now: opts.now ?? Date.now,
       log: opts.log ?? ((l) => console.log(l)),
       diskCache: opts.diskCache,
     };
+    const topN = Math.max(0, Math.floor(opts.fuelMap?.topN ?? 0));
     this.fuel = {
-      topN: Math.max(0, Math.floor(opts.fuelMap?.topN ?? 0)),
+      topN,
       refreshMs: Math.max(1, opts.fuelMap?.refreshMinutes ?? 5) * 60_000,
       minAccountValueUsd: opts.fuelMap?.minAccountValueUsd ?? 10_000,
+      quickN: Math.min(topN, Math.max(0, Math.floor(opts.fuelMap?.quickN ?? 200))),
+      waitMs: opts.fuelMap?.waitMs ?? 8_000,
+      ttlMs: (opts.fuelMap?.ttlMinutes ?? 5) * 60_000,
+      idleMs: (opts.fuelMap?.idleMinutes ?? 10) * 60_000,
     };
-    this.sleep = opts.sleep ?? ((ms) => new Promise((res) => setTimeout(res, ms)));
+    // The default wait never keeps the process alive on its own (unref).
+    this.sleep = opts.sleep ?? ((ms) => new Promise((res) => setTimeout(res, ms).unref?.()));
     this.fuelReport = {
       enabled: this.fuel.topN > 0,
       addressesInSample: 0,
@@ -457,11 +502,49 @@ export class HyperliquidLevelSource {
 
   /**
    * The kept traders (union of both sets). Order of preference: memory cache, disk cache,
-   * download. Concurrent callers share one download.
+   * download. Concurrent callers share one download. An expired copy (memory or disk) is
+   * still returned at once while a fresh download runs in the background (2026-11-21: the
+   * 39 MB download held the first preview for 49 s); only with no copy at all does a caller wait.
    */
   async getTopTraders(): Promise<LeaderboardTrader[]> {
     const now = this.o.now();
     if (this.leaderboard && now - this.leaderboard.at < this.o.leaderboardTtlMs) return this.leaderboard.traders;
+    if (!this.leaderboard && !this.leaderboardInFlight) await this.loadStaleDiskCopy();
+    if (this.leaderboard) {
+      if (now - this.leaderboard.at >= this.o.leaderboardTtlMs && !this.leaderboardInFlight) {
+        this.o.log(`[levels] leaderboard copy is ${Math.round((now - this.leaderboard.at) / 60_000)} min old: using it while a fresh one downloads`);
+        void this.downloadLeaderboard().catch((e) => this.o.log(`[levels] leaderboard refresh failed, keeping the old copy: ${(e as Error).message}`));
+      }
+      return this.leaderboard.traders;
+    }
+    return this.downloadLeaderboard();
+  }
+
+  /** True while there is no copy of the account list at all (the first download is running). */
+  hasLeaderboard(): boolean {
+    return this.leaderboard !== null;
+  }
+
+  /** An expired but matching disk copy, kept in memory so a caller does not wait for the download. */
+  private async loadStaleDiskCopy(): Promise<void> {
+    if (!this.o.diskCache) return;
+    const text = await this.o.diskCache.read().catch(() => null);
+    if (!text) return;
+    try {
+      const cached = toObj(JSON.parse(text));
+      const traders = toArr(cached.traders) as LeaderboardTrader[];
+      if (cached.key === this.selectionKey() && traders.length > 0 && !this.leaderboard) {
+        this.leaderboard = { at: toNum(cached.at), traders, fuelTraders: toArr(cached.fuelTraders) as LeaderboardTrader[] };
+        this.o.log(`[levels] leaderboard from disk cache: kept ${traders.length}`);
+      }
+    } catch {
+      this.o.log("[levels] leaderboard disk cache unreadable, downloading again");
+    }
+  }
+
+  /** Download and trim the leaderboard (shared by concurrent callers). */
+  private downloadLeaderboard(): Promise<LeaderboardTrader[]> {
+    const now = this.o.now();
     if (this.leaderboardInFlight) return this.leaderboardInFlight;
     this.leaderboardInFlight = (async () => {
       // Disk cache holds the TRIMMED list ({at, key, traders}), a few tens of KB instead of 39 MB.
@@ -485,6 +568,7 @@ export class HyperliquidLevelSource {
           }
         }
       }
+      this.sent.leaderboard++;
       const json = await fetchJson(this.o.fetch, HL_LEADERBOARD_URL, { method: "GET" }, this.o.leaderboardTimeoutMs);
       const rowsRead = toArr(toObj(json).leaderboardRows).length;
       const all = parseLeaderboard(json, { topN: Infinity, minAccountValueUsd: Math.min(this.o.selection.minAccountValueUsd, this.o.selection.minAccountValueForVolumeUsd) });
@@ -520,14 +604,23 @@ export class HyperliquidLevelSource {
    * One /info call for one address, from the per-address cache when fresh, else sent
    * if the weight budget allows (else RateBudgetSkip).
    */
-  private async info(type: "clearinghouseState" | "frontendOpenOrders", user: string): Promise<{ json: unknown; cached: boolean }> {
+  private async info(type: "clearinghouseState" | "frontendOpenOrders", user: string, opts: { waitForBudget?: boolean } = {}): Promise<{ json: unknown; cached: boolean; at: number }> {
     const key = `${type}:${user.toLowerCase()}`;
-    const now = this.o.now();
+    let now = this.o.now();
     const hit = this.answerCache.get(key);
-    if (hit && now - hit.at < this.o.levelsTtlMs) return { json: hit.json, cached: true };
+    if (hit && now - hit.at < this.o.levelsTtlMs) return { json: hit.json, cached: true, at: hit.at };
     const w = HL_WEIGHT[type];
+    // Background reads (stage 2 of the map) wait for the budget to free up instead of losing the
+    // request; foreground reads skip at once (a preview never waits on the budget).
+    for (let tries = 0; opts.waitForBudget && this.weightInLastMinute(now) + w > this.o.weightBudgetPerMinute && tries < 20; tries++) {
+      if (this.fuelStopRequested || this.idle()) break;
+      const oldest = this.spent[0];
+      await this.sleep(Math.max(250, oldest ? oldest.at + 60_000 - now : 1_000));
+      now = this.o.now();
+    }
     if (this.weightInLastMinute(now) + w > this.o.weightBudgetPerMinute) throw new RateBudgetSkip(key);
     this.spent.push({ at: now, w });
+    this.sent.info++;
     const json = await fetchJson(
       this.o.fetch,
       HL_INFO_URL,
@@ -535,7 +628,7 @@ export class HyperliquidLevelSource {
       this.o.requestTimeoutMs,
     );
     this.answerCache.set(key, { at: now, json });
-    return { json, cached: false };
+    return { json, cached: false, at: now };
   }
 
   /**
@@ -545,7 +638,7 @@ export class HyperliquidLevelSource {
   async getLevels(coin: string): Promise<{ levels: TraderLevels; report: LevelsReport }> {
     const now = this.o.now();
     const hit = this.coinCache.get(coin);
-    if (hit && now - hit.at < this.o.levelsTtlMs) return { levels: hit.levels, report: { ...hit.report, fromCache: true } };
+    if (hit && now - hit.at < hit.ttlMs) return { levels: hit.levels, report: { ...hit.report, fromCache: true, ageMs: now - hit.at } };
 
     const traders = await this.getTopTraders();
     const sel = selectTraders(traders, this.o.selection);
@@ -586,6 +679,7 @@ export class HyperliquidLevelSource {
       takeProfitsOnCoin: levels.takeProfitLevels.length,
       weightSpent: this.weightInLastMinute(this.o.now()) - before,
       fromCache: false,
+      ageMs: 0,
     };
     this.o.log(
       `[levels] ${coin}: addresses read ${report.addressesRead}; positions asked ${report.positionAddresses}, ok ${report.positionAddressesOk}, failed ${posFailed}; ` +
@@ -596,7 +690,11 @@ export class HyperliquidLevelSource {
     const asked = sel.positions.length + sel.orders.length;
     if (asked > 0 && posFailed + ordFailed === asked) throw new Error(`all ${asked} Hyperliquid trader requests failed`);
     if (asked > 0 && skipped === asked) throw new Error(`all ${asked} Hyperliquid requests skipped: rate budget used up, try again in a minute`);
-    this.coinCache.set(coin, { at: now, levels, report });
+    // A sample that lost more than 10% of its requests (failed or skipped by the budget) is
+    // reused for 60 s only, so the missing traders are read again soon (architect's review 2026-11-21).
+    const lost = posFailed + ordFailed + skipped;
+    report.cachedForMs = asked > 0 && lost > 0.1 * asked ? 60_000 : this.o.traderSampleTtlMs;
+    this.coinCache.set(coin, { at: now, ttlMs: report.cachedForMs, levels, report });
     return { levels, report };
   }
 
@@ -606,10 +704,28 @@ export class HyperliquidLevelSource {
     return this.leaderboard?.fuelTraders ?? [];
   }
 
+  /** Answer one account's clearinghouseState and keep it in the map; the outcome for the counts. */
+  private async readFuelAccount(address: string, opts: { waitForBudget?: boolean } = {}): Promise<"answered" | "failed" | "skipped" | { weight: number }> {
+    try {
+      const { json, cached, at } = await this.info("clearinghouseState", address, opts);
+      // The answer's own time: a cached answer keeps its age (never re-stamped as fresh).
+      this.fuelAnswers.set(address.toLowerCase(), { at, byCoin: parseClearinghouseStateAllCoins(json) });
+      return { weight: cached ? 0 : HL_WEIGHT.clearinghouseState };
+    } catch (e) {
+      return e instanceof RateBudgetSkip ? "skipped" : "failed";
+    }
+  }
+
+  /** True once no preview, level read or place has asked for the map for fuelMapIdleMinutes. */
+  private idle(): boolean {
+    return this.lastTouchAt !== null && this.o.now() - this.lastTouchAt > this.fuel.idleMs;
+  }
+
   /**
    * One pass over the liquidation map's accounts, one request at a time spread evenly over
-   * the refresh window (so a pass of 600 accounts costs 1,200 weight per 5 minutes). Never
-   * called per request: startFuelMap runs it in the background. Concurrent callers share a pass.
+   * the refresh window (a pass of 600 accounts costs 1,200 weight per 5 minutes). Run by the
+   * open-card loop (A10); stops early when the map goes idle or stopFuelMap is called.
+   * Concurrent callers share a pass.
    */
   refreshFuelMap(): Promise<FuelMapReport> {
     if (this.fuelRun) return this.fuelRun;
@@ -627,17 +743,16 @@ export class HyperliquidLevelSource {
         r.addressesInSample = traders.length;
         const gap = traders.length > 0 ? this.fuel.refreshMs / traders.length : 0;
         for (const [i, t] of traders.entries()) {
-          if (this.fuelStopRequested) break; // stopFuelMap was called
+          if (this.fuelStopRequested || this.idle()) break;
           if (i > 0 && gap > 0) await this.sleep(gap);
+          if (this.fuelStopRequested || this.idle()) break;
           asked++;
-          try {
-            const { json, cached } = await this.info("clearinghouseState", t.address);
-            if (!cached) weight += HL_WEIGHT.clearinghouseState;
-            this.fuelAnswers.set(t.address.toLowerCase(), { at: this.o.now(), byCoin: parseClearinghouseStateAllCoins(json) });
+          const out = await this.readFuelAccount(t.address);
+          if (out === "skipped") skipped++;
+          else if (out === "failed") failed++;
+          else if (out !== "answered") {
             answered++;
-          } catch (e) {
-            if (e instanceof RateBudgetSkip) skipped++;
-            else failed++;
+            weight += out.weight;
           }
         }
         r.lastError = asked > 0 && answered === 0 ? `none of ${asked} liquidation-map requests answered (failed ${failed}, skipped by budget ${skipped})` : null;
@@ -646,7 +761,7 @@ export class HyperliquidLevelSource {
       }
       Object.assign(r, { addressesAsked: asked, answered, failed, skippedByBudget: skipped, weightSpent: weight, inProgress: false, lastFinishedAt: this.o.now() });
       r.refreshes++;
-      r.addressesWithFreshAnswer = this.freshFuelAnswers().length;
+      r.addressesWithFreshAnswer = this.usableFuelAnswers().length;
       this.o.log(
         `[levels] liquidation map pass ${r.refreshes}: sample ${r.addressesInSample}, asked ${asked}, answered ${answered}, failed ${failed}, skipped by budget ${skipped}, weight ${weight}` +
           (r.lastError ? `; PROBLEM: ${r.lastError}` : ""),
@@ -658,50 +773,189 @@ export class HyperliquidLevelSource {
     return this.fuelRun;
   }
 
-  /** Start the background refresh: a pass now, then one every refresh window. No-op when the map is off. */
+  /**
+   * Stage 1, the quick map (A10): the first fuelMapQuickN accounts of the sample (the biggest
+   * by 30-day volume), 6 requests in flight, about 400 weight in a few seconds.
+   */
+  private runStage1(): Promise<void> {
+    if (this.stage1Run) return this.stage1Run;
+    this.stage1Run = (async () => {
+      this.stage1StartedAt = this.o.now();
+      let answered = 0;
+      let failed = 0;
+      let skipped = 0;
+      try {
+        const traders = await this.getFuelTraders();
+        this.fuelReport.addressesInSample = traders.length;
+        const quick = traders.slice(0, this.fuel.quickN);
+        const outs = await mapLimited(quick, this.o.concurrency, (t) => this.readFuelAccount(t.address));
+        for (const o of outs) {
+          if (o === "skipped") skipped++;
+          else if (o === "failed" || o instanceof Error) failed++;
+          else answered++;
+        }
+        this.fuelReport.lastError = quick.length > 0 && answered === 0 ? `none of ${quick.length} quick-map requests answered (failed ${failed}, skipped by budget ${skipped})` : null;
+        this.o.log(`[levels] liquidation map stage 1 (quick): asked ${quick.length}, answered ${answered}, failed ${failed}, skipped by budget ${skipped}`);
+      } catch (e) {
+        this.fuelReport.lastError = (e as Error).message;
+        this.o.log(`[levels] liquidation map stage 1 failed: ${(e as Error).message}`);
+      }
+    })().finally(() => {
+      this.stage1Run = null;
+    });
+    return this.stage1Run;
+  }
+
+  /**
+   * Stage 2 (A10): every account of the sample still without a fresh answer (the rest of the
+   * 600, and any quick-map account the budget skipped), starting once the triggering preview's
+   * wait is over, one request every 240 ms (at most 500 weight a minute). It waits for the
+   * per-minute budget instead of losing a request (2026-11-21 smoke: 248 of 400 were lost).
+   */
+  private async runStage2(): Promise<void> {
+    const traders = await this.getFuelTraders().catch(() => [] as LeaderboardTrader[]);
+    const start = (this.stage1StartedAt ?? this.o.now()) + this.fuel.waitMs;
+    if (this.o.now() < start) await this.sleep(start - this.o.now());
+    const gap = (60_000 * HL_WEIGHT.clearinghouseState) / FUEL_STAGE2_WEIGHT_PER_MINUTE;
+    let asked = 0;
+    let answered = 0;
+    let skipped = 0;
+    let failed = 0;
+    for (const t of traders) {
+      if (this.fuelStopRequested || this.idle()) break;
+      const a = this.fuelAnswers.get(t.address.toLowerCase());
+      if (a && this.o.now() - a.at <= this.fuel.ttlMs) continue; // still fresh
+      if (asked > 0) await this.sleep(gap);
+      if (this.fuelStopRequested || this.idle()) break;
+      asked++;
+      const out = await this.readFuelAccount(t.address, { waitForBudget: true });
+      if (typeof out === "object") answered++;
+      else if (out === "skipped") skipped++;
+      else failed++;
+    }
+    // Skipped accounts are read by the next whole pass (it starts as soon as stage 2 ends).
+    this.o.log(`[levels] liquidation map stage 2: asked ${asked}, answered ${answered}, failed ${failed}, skipped by budget ${skipped}`);
+  }
+
+  /**
+   * The open-card loop (A10): stage 2 after the quick map, then whole passes spread over
+   * fuelMapRefreshMinutes, for as long as something asked for the map in the last
+   * fuelMapIdleMinutes. Started by ensureFuelMap; never runs on its own at server start.
+   */
   startFuelMap(): void {
-    if (this.fuel.topN === 0 || !this.fuelStopped) return;
-    this.fuelStopped = false;
+    if (this.fuel.topN === 0) return;
+    this.lastTouchAt ??= this.o.now();
+    if (this.looping) return;
+    this.looping = true;
     this.fuelStopRequested = false;
-    const loop = async () => {
-      const started = this.o.now();
-      await this.refreshFuelMap().catch(() => undefined);
-      if (this.fuelStopped) return;
-      const wait = Math.max(0, started + this.fuel.refreshMs - this.o.now());
-      this.fuelTimer = setTimeout(() => void loop(), wait);
-      this.fuelTimer.unref?.();
-    };
-    void loop();
+    void (async () => {
+      try {
+        if (this.stage1Run) await this.stage1Run;
+        if (!this.idle() && !this.fuelStopRequested) await this.runStage2();
+        while (!this.idle() && !this.fuelStopRequested) {
+          const r = await this.refreshFuelMap().catch(() => null);
+          // Nothing could be asked (leaderboard down): wait a window before trying again, never spin.
+          if (!r || r.addressesAsked === 0) await this.sleep(this.fuel.refreshMs);
+        }
+        if (this.idle()) this.o.log(`[levels] liquidation map idle for ${this.fuel.idleMs / 60_000} min: reading stopped`);
+      } finally {
+        this.looping = false;
+      }
+    })();
   }
 
-  /** Stop the background refresh (a running pass stops at its next request). */
+  /** Stop the open-card loop (a running pass stops at its next request). */
   stopFuelMap(): void {
-    this.fuelStopped = true;
     this.fuelStopRequested = true;
-    if (this.fuelTimer) clearTimeout(this.fuelTimer);
-    this.fuelTimer = null;
   }
 
-  /** Answers young enough to use: at most 3 refresh windows old. */
-  private freshFuelAnswers(): Array<{ at: number; byCoin: Map<string, LiquidationLevel[]> }> {
+  /**
+   * Make sure the liquidation map can serve a plan (A10). Marks the map as wanted (the
+   * open-card loop runs until 10 minutes pass without such a call). With at least half the
+   * sample fresh it sends nothing; otherwise it runs the quick map (stage 1) and waits for it
+   * at most fuelMapWaitMs (opts.wait false: does not wait, e.g. GET /api/levels).
+   */
+  async ensureFuelMap(opts: { wait?: boolean } = {}): Promise<FuelMapReport> {
+    if (this.fuel.topN === 0) return { ...this.fuelReport };
+    this.lastTouchAt = this.o.now();
+    const fresh = this.fuelAnswersWithin(this.fuel.ttlMs).length;
+    const sample = this.fuelReport.addressesInSample || this.fuel.topN;
+    // Stage 1 runs again only when the quick map itself is not fresh, or when the map is under
+    // half fresh and nothing is filling it in. A stage 2 or a pass already running fills the rest:
+    // re-reading the quick map then would only take budget from it (seen live 2026-11-21).
+    const quickFresh = await this.quickMapFresh();
+    const quickSize = Math.min(this.fuel.quickN, this.leaderboard?.fuelTraders.length ?? this.fuel.quickN);
+    if (quickFresh < quickSize / 2 || (!this.looping && fresh < sample / 2)) {
+      const run = this.runStage1();
+      this.startFuelMap();
+      if (opts.wait !== false) {
+        let timer = false;
+        await Promise.race([run, this.sleep(this.fuel.waitMs).then(() => void (timer = true))]);
+        if (timer) this.o.log(`[levels] liquidation map: built after ${this.fuel.waitMs} ms with ${this.usableFuelAnswers().length} accounts, still reading`);
+      }
+    } else {
+      this.startFuelMap();
+    }
+    return { ...this.fuelReport, addressesWithFreshAnswer: this.usableFuelAnswers().length };
+  }
+
+  /** How many of the quick-map accounts (the first fuelMapQuickN of the sample) hold a fresh answer. */
+  private async quickMapFresh(): Promise<number> {
+    if (!this.leaderboard) return 0; // nothing read yet (the sample comes with the first read)
     const now = this.o.now();
-    return [...this.fuelAnswers.values()].filter((a) => now - a.at <= 3 * this.fuel.refreshMs);
+    return this.leaderboard.fuelTraders.slice(0, this.fuel.quickN).filter((t) => {
+      const a = this.fuelAnswers.get(t.address.toLowerCase());
+      return a !== undefined && now - a.at <= this.fuel.ttlMs;
+    }).length;
+  }
+
+  /** Answers at most `ms` old. */
+  private fuelAnswersWithin(ms: number): Array<{ at: number; byCoin: Map<string, LiquidationLevel[]> }> {
+    const now = this.o.now();
+    return [...this.fuelAnswers.values()].filter((a) => now - a.at <= ms);
+  }
+
+  /** Answers young enough to use: at most 3 refresh windows (15 minutes) old, never past that. */
+  private usableFuelAnswers(): Array<{ at: number; byCoin: Map<string, LiquidationLevel[]> }> {
+    return this.fuelAnswersWithin(3 * this.fuel.refreshMs);
+  }
+
+  /** Requests this source has sent to Hyperliquid (leaderboard and info), for the health check. */
+  requestsSent(): { leaderboard: number; info: number } {
+    return { ...this.sent };
   }
 
   /**
    * The liquidation map for one coin, from the answers already in memory (never a request).
-   * "unavailable" when the map is off, no account has a fresh answer yet, or under half the
-   * sample has one ("thin: N of 600 accounts"); the note says why.
+   * stage: "reading" (the quick map is still being read), "quick" (some of the sample),
+   * "full" (the whole sample), "stale" (answers exist but all older than 15 minutes), "none".
+   * "unavailable" when the map is off, no usable answer exists, or fewer than half of the
+   * quick map answered once reading stopped ("thin: N of 600 accounts"). While the quick map
+   * is still being read the plan uses what answered and `reading` says how much.
    * With a price, the report also counts shorts above, longs below and bands within 20%.
    */
   getFuelLevels(coin: string, price?: number): FuelLevels {
-    const fresh = this.freshFuelAnswers();
-    const levels = fresh.flatMap((a) => a.byCoin.get(coin) ?? []);
+    const usable = this.usableFuelAnswers();
+    const fresh = this.fuelAnswersWithin(this.fuel.ttlMs).length;
+    const levels = usable.flatMap((a) => a.byCoin.get(coin) ?? []);
+    const sample = this.fuelReport.addressesInSample || this.fuel.topN;
+    const isReading = this.stage1Run !== null;
+    const stage: FuelMapStage = isReading ? "reading" : usable.length === 0 ? (this.fuelAnswers.size > 0 ? "stale" : "none") : usable.length >= sample ? "full" : "quick";
+    const reading = !isReading
+      ? null
+      : this.leaderboard === null
+        ? `liquidation map: the account list is still downloading (no cached copy yet), 0 of ${sample} accounts read`
+        : `liquidation map: ${usable.length} of ${sample} accounts, still reading`;
     let note: string | null = null;
     if (this.fuel.topN === 0) note = "liquidation map is off (target.fuelMapTopN is 0)";
-    else if (fresh.length === 0) note = this.fuelReport.inProgress || this.fuelReport.refreshes === 0 ? "liquidation map not read yet (first pass running)" : `liquidation map has no fresh answer (${this.fuelReport.lastError ?? "no account answered"})`;
-    // Under half the sample fresh: too thin to call "no cluster" a fact, so it counts as unavailable.
-    else if (this.fuelReport.addressesInSample > 0 && fresh.length < this.fuelReport.addressesInSample / 2) note = `thin: ${fresh.length} of ${this.fuelReport.addressesInSample} accounts`;
+    else if (usable.length === 0)
+      note = isReading
+        ? "liquidation map not read yet"
+        : this.fuelAnswers.size > 0
+          ? "liquidation map stale: every answer is older than 15 minutes"
+          : `liquidation map has no fresh answer (${this.fuelReport.lastError ?? "nothing read yet"})`;
+    // Fewer than half of the quick map answered and nothing more is coming: too thin to call "no cluster" a fact.
+    else if (!isReading && usable.length < Math.max(1, Math.min(this.fuel.quickN, sample)) / 2) note = `thin: ${usable.length} of ${sample} accounts`;
     let shortAbove: number | null = null;
     let longBelow: number | null = null;
     let bands: number | null = null;
@@ -719,7 +973,18 @@ export class HyperliquidLevelSource {
       levels,
       status: note ? "unavailable" : "ok",
       note,
-      report: { ...this.fuelReport, addressesWithFreshAnswer: fresh.length, coin, liquidationLevels: levels.length, shortLevelsAbove: shortAbove, longLevelsBelow: longBelow, bandsWithin20pct: bands },
+      reading,
+      report: {
+        ...this.fuelReport,
+        addressesWithFreshAnswer: usable.length,
+        stage,
+        fresh,
+        coin,
+        liquidationLevels: levels.length,
+        shortLevelsAbove: shortAbove,
+        longLevelsBelow: longBelow,
+        bandsWithin20pct: bands,
+      },
     };
   }
 }

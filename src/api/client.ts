@@ -9,9 +9,30 @@ import type { SetInput } from "../core/types";
 import type { SetRules } from "../rules/rules";
 
 /** Answer of a preview. asterOrders is the exact legs the server would sign (opaque to the card). */
-export interface PreviewResponse {
+export interface PreviewPlan {
   plan: SetPlan;
   asterOrders?: unknown;
+  /** What the plan was built from; the card reads only the liquidation map's progress. */
+  sources?: { fuelMap?: { stage: string; addressesWithFreshAnswer: number; addressesInSample: number } | null };
+}
+
+/**
+ * A preview the server refused before anything was sent (HTTP 409): the anti-chase guard
+ * ("refused: chasing", with a hint to preview the other side) or a guard that could not run
+ * ("refused: guard unavailable", no hint). message is the sentence the card shows.
+ */
+export interface PreviewRefusal {
+  refused: true;
+  status: string;
+  message: string;
+  hint: { label: string; input: SetInput } | null;
+}
+
+export type PreviewResponse = PreviewPlan | PreviewRefusal;
+
+/** True for a refused preview. */
+export function isRefusal(r: PreviewResponse | undefined): r is PreviewRefusal {
+  return !!r && (r as PreviewRefusal).refused === true;
 }
 
 /** Answer of a placement. status "trial: not sent" in trial mode. */
@@ -48,8 +69,13 @@ export const demoServerApi: SetCardApi = {
     const r = await call<{ price: number }>(`/api/price?symbol=${encodeURIComponent(symbol)}`);
     return r.price;
   },
-  preview(input) {
-    return call<PreviewResponse>("/api/set/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+  async preview(input) {
+    const res = await fetch("/api/set/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });
+    const body = (await res.json().catch(() => ({}))) as { error?: string; refused?: boolean };
+    // A refusal is an answer, not a failure: the card shows its sentence and the hint.
+    if (res.status === 409 && body.refused === true) return body as PreviewRefusal;
+    if (!res.ok) throw new Error(body.error ?? `request failed: HTTP ${res.status}`);
+    return body as PreviewPlan;
   },
   place(input) {
     return call<PlaceResponse>("/api/set/place", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input) });

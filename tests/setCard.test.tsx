@@ -129,3 +129,119 @@ describe("summary helpers", () => {
     expect(optionsLine(30, null)).toBe("30x · ...");
   });
 });
+
+describe("Set card: refusals, the map's progress, and the 30 s refresh (architect's review 2026-11-21)", () => {
+  const planFor = (input: SetInput) => buildSetPlan({ input, currentPrice: 64000, rules: BTC, levels: LEVELS, random: () => 0.5 });
+
+  it("a refused Sell shows the refusal's two lines and a button that previews a Long; Enter stays off while refused", async () => {
+    const previews: SetInput[] = [];
+    const api: SetCardApi = {
+      getPrice: async () => 64000,
+      preview: async (input) => {
+        previews.push(input);
+        if (input.side === "sell") {
+          return {
+            refused: true,
+            status: "refused: chasing",
+            message: "BTC fell 7.0% in a day, in the bottom 10% of its 3-day range.\nA Short here would follow the move at its edge.",
+            hint: { label: "preview a Long instead", input: { ...input, side: "buy" } },
+          };
+        }
+        return { plan: planFor(input) };
+      },
+      place: async () => {
+        throw new Error("not used in this test");
+      },
+    };
+    renderCard(api);
+    await waitFor(() => expect(previews.length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByRole("button", { name: "Sell" }));
+    const box = await screen.findByTestId("refusal");
+    expect([...box.querySelectorAll("div")].map((d) => d.textContent)).toEqual([
+      "BTC fell 7.0% in a day, in the bottom 10% of its 3-day range.",
+      "A Short here would follow the move at its edge.",
+    ]);
+    expect((screen.getByRole("button", { name: /Enter Sell/ }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Preview a Long instead" }));
+    // The hint switches the card to the other side (its Long plan was cached from the first preview).
+    await waitFor(() => expect(screen.queryByTestId("refusal")).toBeNull());
+    expect(previews.some((p) => p.side === "buy")).toBe(true);
+    await waitFor(() => expect((screen.getByRole("button", { name: /Enter Buy/ }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
+  it("a guard that could not run shows its lines and no button (negative)", async () => {
+    const api: SetCardApi = {
+      getPrice: async () => 64000,
+      preview: async () => ({ refused: true, status: "refused: guard unavailable", message: "No Set now: the anti-chase check could not load Aster's hourly prices.\nError: HTTP 503", hint: null }),
+      place: async () => {
+        throw new Error("not used");
+      },
+    };
+    renderCard(api);
+    expect((await screen.findByTestId("refusal")).textContent).toContain("could not load Aster's hourly prices");
+    expect(screen.queryByTestId("refusal-hint")).toBeNull();
+  });
+
+  it("while the map is still being read the card says so in one line; once full the line goes", async () => {
+    let stage = "quick";
+    const api: SetCardApi = {
+      getPrice: async () => 64000,
+      preview: async (input) => ({ plan: planFor(input), sources: { fuelMap: { stage, addressesWithFreshAnswer: stage === "full" ? 600 : 200, addressesInSample: 600 } } }),
+      place: async () => {
+        throw new Error("not used");
+      },
+    };
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SetCard api={api} />
+      </QueryClientProvider>,
+    );
+    expect((await screen.findByTestId("map-reading")).textContent).toContain("Reading the liquidation map (200 of 600)");
+    stage = "full";
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ["set-preview"] });
+    });
+    await waitFor(() => expect(screen.queryByTestId("map-reading")).toBeNull());
+  });
+
+  it("the 30 s refresh keeps the options line and the Enter button while the new plan loads", async () => {
+    let release: (() => void) | null = null;
+    let calls = 0;
+    const api: SetCardApi = {
+      getPrice: async () => 64000,
+      preview: async (input) => {
+        calls++;
+        if (calls > 1) await new Promise<void>((r) => (release = r)); // the refresh hangs until released
+        return { plan: planFor(input) };
+      },
+      place: async () => {
+        throw new Error("not used");
+      },
+    };
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SetCard api={api} />
+      </QueryClientProvider>,
+    );
+    const row = await screen.findByTestId("set-summary-row");
+    const line = optionsLine(30, planFor({ symbol: "BTCUSDT", side: "buy", ticketUsd: 10, leverage: 30, tpMode: "deserved", entryMode: "nearby" }));
+    await waitFor(() => expect(row.textContent).toContain(line));
+    const enter = screen.getByRole("button", { name: /Enter Buy/ }) as HTMLButtonElement;
+    await waitFor(() => expect(enter.disabled).toBe(false));
+    let refetch: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      refetch = qc.refetchQueries({ queryKey: ["set-preview"] });
+    });
+    await waitFor(() => expect(release).not.toBeNull()); // the refresh is in flight
+    expect(row.textContent).toContain(line); // not blanked
+    expect(row.textContent).not.toContain("checking traders' orders");
+    expect(enter.disabled).toBe(false); // still tappable
+    await act(async () => {
+      release!();
+      await refetch;
+    });
+    expect(row.textContent).toContain(line);
+  });
+});

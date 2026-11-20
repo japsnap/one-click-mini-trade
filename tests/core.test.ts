@@ -9,7 +9,8 @@
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { parseDepth } from "../src/exchange/aster";
+import { parseDepth, parseKlines } from "../src/exchange/aster";
+import { DEFAULT_RULES } from "../src/rules/rules";
 import {
   assertRatioAtLeastOne,
   buildSetPlan,
@@ -19,8 +20,10 @@ import {
   exactTakeProfitPrice,
   findLiquidationCluster,
   findLiquidationClusterWithCounts,
+  chaseCheck,
   chooseTarget,
   frontOfBrake,
+  planHeadline,
   realizedVol1h,
   remeasureAfterFill,
   swingLevels,
@@ -221,7 +224,7 @@ describe("target v2 (Sets_Rules.md E1)", () => {
     expect(tp.source).toBe("round-number");
     expect(tp.reason).toContain("1,900");
     expect(tp.reason).toContain("no liquidation cluster between 1.9x and 4x");
-    expect(tp.reason).toBe("no liquidation cluster between 1.9x and 4x, so target 1,899.43, just in front of 1,900 (a round number), 1.97x the stop (floor 2x, slack 0.1x)");
+    expect(tp.reason).toBe("Long from 1,805.73; take profit (sell) at 1,899.43, 1.97x the stop (sell at 1,758.19), within the 0.1x slack of the 2x floor: no liquidation cluster between 1.9x and 4x, so the sale sits just in front of 1,900 (a round number)");
     expect(tp.counts.liquidationLevelsRead).toBe(0);
     expect(tp.counts).toMatchObject({ clustersFound: 0, roundNumbers: 2, brakesFound: 2, candidatesScored: 2, horizonHours: 48, sigma1h: 0.007, sigmaSource: "measured" });
     expect(tp.counts.winner).toMatchObject({ kind: "round-number", pull: 0.5, pass: 1 });
@@ -232,23 +235,25 @@ describe("target v2 (Sets_Rules.md E1)", () => {
     expect(tp.price).toBe(1949.41);
     expect(tp.ratio).toBeCloseTo(3.022, 3);
     expect(tp.source).toBe("liquidation-cluster");
-    for (const part of ["$2.5M", "3 traders", "1,950"]) expect(tp.reason).toContain(part);
-    expect(tp.reason).toBe("target 1,949.41, just in front of 1,950 (a round number) at the edge of a cluster where $2.5M of 3 traders' shorts get liquidated (1,950.4 to 1,951.9), 3.02x the stop");
-    // The spec's worked scores: 0.74 against 1.38.
-    expect(scoreAt(tp, "liquidation-cluster", 1899.43)!.score).toBeCloseTo(0.74, 1);
-    expect(Math.abs(scoreAt(tp, "liquidation-cluster", 1899.43)!.score - 0.74)).toBeLessThan(0.02);
+    for (const part of ["$2.5M", "3 accounts", "1,950"]) expect(tp.reason).toContain(part);
+    expect(tp.reason).toBe("Long from 1,805.73; take profit (sell) at 1,949.41, 3.02x the stop (sell at 1,758.19): the sale sits just in front of 1,950 (a round number) at the edge of a cluster where $2.5M of 3 accounts' shorts get liquidated (1,950.4 to 1,951.9; the largest holds 36%)");
+    // The spec's worked scores: 0.74 against 1.38. Since A11 (2026-11-21) the $150k one-account cluster is
+    // kept out of the race (it would not have won, so the reason does not name it).
+    expect(tp.scored.some((c) => c.kind === "liquidation-cluster" && c.price === 1899.43)).toBe(false);
     expect(Math.abs(scoreAt(tp, "liquidation-cluster", 1949.41)!.score - 1.38)).toBeLessThan(0.02);
     expect(scoreAt(tp, "liquidation-cluster", 1949.41)!.pass).toBeCloseTo(0.8, 9); // 1,900 is in the way
-    expect(tp.counts).toMatchObject({ liquidationLevelsRead: 4, liquidationsOnProfitSide: 4, liquidationsInWindow: 4, clustersFound: 2 });
+    expect(tp.counts).toMatchObject({ liquidationLevelsRead: 4, liquidationsOnProfitSide: 4, liquidationsInWindow: 4, clustersFound: 1, clustersLoneTrader: 1 });
+    expect(tp.reason).not.toContain("does not count");
   });
 
-  it("(c) quieter market (sigma1h 0.0045): the near $150k cluster wins; the $2.5M one is out of reach", () => {
+  it("(c) quieter market (sigma1h 0.0045): the near $150k level would win but is one account's (A11), so 1,900 wins; the $2.5M one is out of reach", () => {
     const tp = pickTakeProfit({ ...base, liquidationLevels: fuelB, sigma1h: 0.0045 });
     expect(tp.price).toBe(1899.43);
     expect(tp.ratio).toBeCloseTo(1.971, 3);
-    expect(tp.source).toBe("liquidation-cluster");
-    expect(tp.reason).toContain("$150k");
-    expect(Math.abs(tp.counts.winner!.score - 0.25)).toBeLessThan(0.02);
+    expect(tp.source).toBe("round-number");
+    expect(tp.reason).toContain("a $150k cluster at 1,901.5 was one account's and does not count");
+    expect(Math.abs(tp.wouldHaveWon!.score - 0.25)).toBeLessThan(0.02); // the spec's 0.25, now scored aside
+    expect(tp.counts.clustersLoneTrader).toBe(1);
     const far = scoreAt(tp, "liquidation-cluster", 1949.41)!;
     expect(far.dropped).toBe("out of reach");
     expect(far.reach).toBeCloseTo(0.011, 3);
@@ -260,17 +265,20 @@ describe("target v2 (Sets_Rules.md E1)", () => {
     expect(tp.price).toBe(1999.4);
     expect(tp.ratio).toBeCloseTo(4.074, 3);
     expect(tp.source).toBe("liquidation-cluster");
-    expect(tp.reason).toContain("$400k of 2 traders' shorts");
+    expect(tp.reason).toContain("$400k of 2 accounts' shorts get liquidated (2,000.5 to 2,001.2; the largest holds 63%)");
     expect(tp.counts).toMatchObject({ horizonHours: 96, roundNumbers: 4, clustersFound: 1 });
   });
 
   it("(e) a $4M wall beats a lighter cluster, then A5 pulls it in front of 1,900", () => {
     const tp = pickTakeProfit({ ...base, oppositeVolume: [{ price: 1902, weightUsd: 4_000_000 }], liquidationLevels: [short(1925, 300_000)] });
     const wall = tp.scored.find((c) => c.kind === "wall")!;
-    const cluster = tp.scored.find((c) => c.kind === "liquidation-cluster")!;
+    // The $300k at 1,925 is one account's: since A11 it is scored aside (0.56) and never in the race.
+    expect(tp.scored.some((c) => c.kind === "liquidation-cluster")).toBe(false);
+    expect(tp.counts.clustersLoneTrader).toBe(1);
+    const cluster = pickTakeProfit({ ...base, oppositeVolume: [{ price: 1902, weightUsd: 4_000_000 }], liquidationLevels: [short(1925, 180_000), short(1925.5, 120_000)] }).scored.find((c) => c.kind === "liquidation-cluster")!;
     expect(Math.abs(wall.score - 1.62)).toBeLessThan(0.02);
     expect(wall.pass).toBeCloseTo(0.8, 9);
-    expect(Math.abs(cluster.score - 0.56)).toBeLessThan(0.02);
+    expect(Math.abs(cluster.score - 0.62)).toBeLessThan(0.02); // two accounts: the density bonus lifts the spec's 0.56 to 0.62
     expect(cluster.pass).toBeCloseTo(0.64, 9); // 1,900 and the wall in the way
     expect(tp.price).toBe(1899.43);
     expect(tp.source).toBe("wall");
@@ -295,16 +303,16 @@ describe("target v2 (Sets_Rules.md E1)", () => {
     expect(bare.price).toBe(1900.81);
     expect(bare.source).toBe("exact-ratio");
     expect(bare.ratio).toBe(2);
-    expect(bare.reason.startsWith("the bare 2x")).toBe(true);
+    expect(bare.reason).toBe("Long from 1,805.73; take profit (sell) at 1,900.81, 2x the stop (sell at 1,758.19): the bare 2x: no liquidation cluster, wall, round number or swing high between 1.9x and 4x within reach");
     const near = chooseTarget({ ...args, candidates: [], brakes: [{ kind: "round-number", price: 1900, restingUsd: 0 }] });
     expect(near.price).toBe(1899.43); // 1,900.81 is 0.043% beyond 1,900, inside the 0.1% gap
     expect(near.source).toBe("exact-ratio");
-    expect(near.reason.startsWith("the bare 2x")).toBe(true);
+    expect(near.reason).toContain(": the bare 2x, pulled in front of 1,900 (a round number): no liquidation cluster");
     expect(near.reason).toContain("pulled in front of 1,900");
   });
 
   it("(h) minReach: a $30M cluster at 1,995 in a dead market is out of reach; the bare floor pulled in front of 1,900", () => {
-    const tp = pickTakeProfit({ ...base, sigma1h: 0.002, liquidationLevels: [short(1995, 30_000_000)] });
+    const tp = pickTakeProfit({ ...base, sigma1h: 0.002, liquidationLevels: [short(1995, 15_000_000), short(1995.5, 15_000_000)] }); // two accounts (A11)
     expect(scoreAt(tp, "liquidation-cluster", 1994)!.reach).toBeLessThan(0.00001);
     expect(scoreAt(tp, "round-number", 1899.43)!.reach).toBeCloseTo(0.00018, 5);
     expect(tp.price).toBe(1899.43);
@@ -314,7 +322,7 @@ describe("target v2 (Sets_Rules.md E1)", () => {
   });
 
   it("(i) slack line: a $5M cluster at 1,897.0 (1.92x) is accepted, clamped to the line 1,896.06", () => {
-    const tp = pickTakeProfit({ ...base, liquidationLevels: [short(1897, 5_000_000)] });
+    const tp = pickTakeProfit({ ...base, liquidationLevels: [short(1897, 3_000_000), short(1897.4, 2_000_000)] }); // two accounts (A11)
     expect(tp.price).toBe(1896.06);
     expect(tp.ratio).toBeGreaterThanOrEqual(1.9);
     expect(tp.ratio).toBeCloseTo(1.9, 3);
@@ -323,8 +331,8 @@ describe("target v2 (Sets_Rules.md E1)", () => {
   });
 
   it("(i) slack line: a cluster starting at 1,890.0 (1.77x) is clamped only while its far edge reaches the line, else dropped (negative)", () => {
-    // Five neighbouring 0.1% bands, 1,890.0 to 1,897.0: the clamp 1,896.06 lies inside the cluster.
-    const run = [short(1890, 5_000_000), short(1891.9, 10_000), short(1893.7, 10_000), short(1895.5, 10_000), short(1897, 10_000)];
+    // Five accounts, 1,890.0 to 1,897.0 (inside 1.5% of 1,890): the clamp 1,896.06 lies inside the cluster.
+    const run = [short(1890, 4_000_000), short(1891.9, 250_000), short(1893.7, 250_000), short(1895.5, 250_000), short(1897, 250_000)];
     const kept = pickTakeProfit({ ...base, liquidationLevels: run });
     expect(kept.price).toBe(1896.06);
     expect(kept.source).toBe("liquidation-cluster");
@@ -381,7 +389,7 @@ describe("target v2 (Sets_Rules.md E1)", () => {
   it("the liquidation map unavailable: brakes alone, and the reason says so (A6.3)", () => {
     const tp = pickTakeProfit({ ...base, liquidationLevels: fuelB, fuelMap: "unavailable" });
     expect(tp.source).toBe("round-number");
-    expect(tp.reason.startsWith("liquidation map unavailable, so target 1,899.43")).toBe(true);
+    expect(tp.reason).toContain(": liquidation map unavailable, so the sale sits just in front of 1,900");
     expect(tp.counts).toMatchObject({ fuelMap: "unavailable", liquidationLevelsRead: 0 });
   });
 
@@ -840,17 +848,17 @@ describe("target v2: review fixes of 2026-11-20", () => {
     expect(tp.price).toBe(1700.51);
     expect(tp.ratio).toBeCloseTo(2.213, 3);
     expect(tp.source).toBe("liquidation-cluster");
-    expect(tp.reason).toBe("target 1,700.51, just in front of 1,700 (a round number) at the edge of a cluster where $2.0M of 2 traders' longs get liquidated (1,699.6 to 1,699.1), 2.21x the stop");
+    expect(tp.reason).toBe("Short from 1,805.73; take profit (buy back) at 1,700.51, 2.21x the stop (buy back at 1,853.27): the buy-back sits just in front of 1,700 (a round number) at the edge of a cluster where $2.0M of 2 accounts' longs get liquidated (1,699.6 to 1,699.1; the largest holds 60%)");
     expect(tp.counts).toMatchObject({ liquidationLevelsRead: 3, liquidationsOnProfitSide: 2, clustersFound: 1 });
   });
 
   it("A5 'stays': clamped to the 1.9x line just behind a wall that the line itself passes; the reason says why it stays", () => {
-    const tp = pickTakeProfit({ ...base, oppositeVolume: [{ price: 1895.5, weightUsd: 30_000 }], liquidationLevels: [liq(1897, 5_000_000, "short")] });
+    const tp = pickTakeProfit({ ...base, oppositeVolume: [{ price: 1895.5, weightUsd: 30_000 }], liquidationLevels: [liq(1897, 3_000_000, "short"), liq(1897.4, 2_000_000, "short")] });
     expect(tp.price).toBe(1896.06);
     expect(tp.source).toBe("liquidation-cluster");
     expect(tp.pulledInFrontOf).toBeNull();
     expect(tp.reason).toBe(
-      "target 1,896.06, on the slack line inside a cluster where $5.0M of 1 trader's shorts get liquidated (1,897), 1.9x the stop (floor 2x, slack 0.1x); it stays just behind a wall of $30k of sell orders at 1,895.5, because in front of it would break the 1.9x line",
+      "Long from 1,805.73; take profit (sell) at 1,896.06, 1.9x the stop (sell at 1,758.19), within the 0.1x slack of the 2x floor: the sale sits on the slack line inside a cluster where $5.0M of 2 accounts' shorts get liquidated (1,897 to 1,897.4; the largest holds 60%); it stays just behind a wall of $30k of sell orders at 1,895.5, because in front of it would break the 1.9x line",
     );
   });
 
@@ -859,7 +867,7 @@ describe("target v2: review fixes of 2026-11-20", () => {
     expect(tp.brakes.map((b) => [b.kind, b.price])).toEqual([["round-number", 1900], ["wall", 1946], ["round-number", 1950]]);
     expect(tp.price).toBe(1945.41);
     expect(tp.source).toBe("liquidation-cluster");
-    expect(tp.reason).toContain("just in front of a wall of $30k of sell orders at 1,946 at the edge of a cluster where $2.5M of 3 traders' shorts");
+    expect(tp.reason).toContain("just in front of a wall of $30k of sell orders at 1,946 at the edge of a cluster where $2.5M of 3 accounts' shorts");
   });
 
   it("sigmaSource says floor when the sigma passed was already floored", () => {
@@ -875,7 +883,7 @@ describe("target v2: review fixes of 2026-11-20", () => {
   it("a thin liquidation map reads as unavailable and the reason carries the count", () => {
     const tp = pickTakeProfit({ ...base, liquidationLevels: [liq(1950.4, 2_500_000, "short")], fuelMap: "unavailable", fuelMapNote: "thin: 12 of 600 accounts" });
     expect(tp.source).toBe("round-number");
-    expect(tp.reason.startsWith("liquidation map unavailable (thin: 12 of 600 accounts), so target 1,899.43")).toBe(true);
+    expect(tp.reason).toContain(": liquidation map unavailable (thin: 12 of 600 accounts), so the sale sits just in front of 1,900");
     expect(tp.counts).toMatchObject({ fuelMap: "unavailable", fuelMapNote: "thin: 12 of 600 accounts", liquidationLevelsRead: 0 });
   });
 
@@ -898,5 +906,223 @@ describe("target v2: review fixes of 2026-11-20", () => {
     expect(w40.takeProfit.price).toBe(1899.43);
     expect(w40.takeProfit.reason).toContain(`${Number(w40.takeProfit.ratio.toFixed(2))}x the stop`);
     expect(withSymbolLeverage(plan, ETH, 30)).toBe(plan); // not higher: unchanged
+  });
+});
+
+/** Fixtures of 2026-11-20 and 2026-11-21 (public data only: Hyperliquid account answers and Aster candles; tests/fixtures/SOURCES.txt). */
+const PROBE = JSON.parse(readFileSync(new URL("./fixtures/hl-fuel-2026-11-21.json", import.meta.url), "utf8")) as {
+  at: string;
+  positions: Array<{ coin: string; side: "long" | "short"; liq: number; notional: number }>;
+  market: Record<string, { price: number; k1h: unknown[] }>;
+};
+const K1121 = parseKlines(JSON.parse(readFileSync(new URL("./fixtures/aster-klines-ETHUSDT-2026-11-21.json", import.meta.url), "utf8"))).klines;
+const K1120 = parseKlines(JSON.parse(readFileSync(new URL("./fixtures/aster-klines-ETHUSDT-2026-11-20-0131.json", import.meta.url), "utf8"))).klines;
+const AS_OF_1121 = Date.parse(PROBE.at); // 2026-11-20T19:13:41.906Z (04:13 JST on the 21st)
+const AS_OF_1120 = Date.parse("2026-11-20T01:31:00Z");
+
+describe("breadth: a cluster is a crowd (A11, E9)", () => {
+  const L = (price: number, weightUsd: number, positionSide: "long" | "short"): LiquidationLevel => ({ price, weightUsd, positionSide });
+  const eth = { entry: 1765, side: "buy" as const, stopPrice: 1722.5, mode: "deserved" as const, tickSize: 0.01, sigma1h: 0.00626, random: () => 0.5 };
+  const btc = (() => {
+    const s = planStop({ entry: 58140, side: "buy", leverage: 30, tickSize: 0.1, maintenanceMarginRate: 0.005, maintenanceSource: "assumed" });
+    return { entry: 58140, side: "buy" as const, stopPrice: s.stopPrice, mode: "deserved" as const, tickSize: 0.1, sigma1h: 0.007, random: () => 0.5 };
+  })();
+
+  it("(a) one account's $25M at 1,908.34 alone is no cluster; counted as a lone trader and named, since it would have won", () => {
+    const tp = pickTakeProfit({ ...eth, liquidationLevels: [L(1908.34, 25_000_000, "short")] });
+    expect(tp.source).not.toBe("liquidation-cluster");
+    expect(tp.counts).toMatchObject({ clustersFound: 0, clustersLoneTrader: 1, clustersWhaleOnly: 0 });
+    expect(tp.reason).toContain("a $25M cluster at 1,908.34 was one account's and does not count");
+    expect(tp.wouldHaveWon!.score).toBeGreaterThan(tp.counts.winner!.score);
+  });
+
+  it("(b) $117M of one account plus $2.8M of two within 0.2% fails (share 98%); with $23M of three more at 62,739 it passes (6 accounts, 82%, rest $26M)", () => {
+    const whale = [L(62437, 117_000_000, "short"), L(62480, 1_500_000, "short"), L(62540, 1_300_000, "short")];
+    const no = pickTakeProfit({ ...btc, liquidationLevels: whale });
+    expect(no.counts).toMatchObject({ clustersFound: 0, clustersWhaleOnly: 1 });
+    expect(no.reason).toContain("a $120M cluster at 62,437 was mostly one account's (98%) and does not count");
+    const yes = pickTakeProfit({ ...btc, liquidationLevels: [...whale, L(62739, 8_000_000, "short"), L(62739.5, 8_000_000, "short"), L(62740, 7_000_000, "short")] });
+    expect(yes.counts).toMatchObject({ clustersFound: 1, clustersWhaleOnly: 0 });
+    const c = yes.scored.find((x) => x.kind === "liquidation-cluster")!.cluster!;
+    expect(c).toMatchObject({ traders: 6, nearEdge: 62437, farEdge: 62740 });
+    expect(c.share).toBeCloseTo(117 / 142.8, 3);
+    expect(c.restUsd).toBeCloseTo(25_800_000, -3);
+    expect(yes.source).toBe("liquidation-cluster");
+    expect(yes.reason).toContain("$143M of 6 accounts' shorts get liquidated (62,437 to 62,740; the largest holds 82%)");
+  });
+
+  it("(c) $1.1M of 2 accounts with the largest at 71% passes; with the second at $20k it fails (the rest is under $100k)", () => {
+    const sell = { entry: 1598.96, side: "sell" as const, stopPrice: 1637.46, mode: "deserved" as const, tickSize: 0.01, sigma1h: 0.0085, random: () => 0.5 };
+    const ok = pickTakeProfit({ ...sell, liquidationLevels: [L(1445.77, 781_000, "long"), L(1445.63, 319_000, "long")] });
+    expect(ok.counts).toMatchObject({ clustersFound: 1, clustersWhaleOnly: 0 });
+    expect(ok.source).toBe("liquidation-cluster");
+    expect(ok.reason).toContain("$1.1M of 2 accounts' longs get liquidated (1,445.77 to 1,445.63; the largest holds 71%)");
+    const thin = pickTakeProfit({ ...sell, liquidationLevels: [L(1445.77, 781_000, "long"), L(1445.63, 20_000, "long")] });
+    expect(thin.counts).toMatchObject({ clustersFound: 0, clustersWhaleOnly: 1 });
+    expect(thin.source).not.toBe("liquidation-cluster");
+  });
+
+  it("(d) replay of the 2026-11-20 01:31Z ETH Short: the $10M one-account cluster drops; the buy-back falls to the brakes with the A6 reason", () => {
+    const vol = realizedVol1h(K1120.map((k) => k.close));
+    const tp = pickTakeProfit({ entry: 1764.96, side: "sell", stopPrice: 1807.46, mode: "deserved", tickSize: 0.01, sigma1h: vol.sigma1h, random: () => 0.5, liquidationLevels: [L(1666.69, 10_000_000, "long")] });
+    expect(tp.source).toBe("round-number");
+    expect(tp.price).not.toBe(1667.52);
+    expect(tp.counts.clustersLoneTrader).toBe(1);
+    expect(tp.reason).toMatch(/^Short from 1,764\.96; take profit \(buy back\) at [\d,.]+, [\d.]+x the stop \(buy back at 1,807\.46\)/);
+    expect(tp.reason).toContain("no liquidation cluster between 1.9x and 4x, so the buy-back sits just in front of");
+    expect(tp.reason).toContain("a $10M cluster at 1,666.69 was one account's and does not count");
+  });
+
+  it("(e) on the 2026-11-21 probe (600 accounts): ETH Long Deserved picks the $11.2M two-account cluster; BTC Short Deserved picks one of the three crowds", () => {
+    const pick = (sym: string, coin: string, side: "buy" | "sell", tick: number) => {
+      const m = PROBE.market[sym]!;
+      const vol = realizedVol1h(parseKlines(m.k1h).klines.map((k) => k.close));
+      const s = planStop({ entry: m.price, side, leverage: 30, tickSize: tick, maintenanceMarginRate: 0.005, maintenanceSource: "assumed" });
+      const fuel = PROBE.positions.filter((p) => p.coin === coin).map((p) => L(p.liq, p.notional, p.side));
+      return pickTakeProfit({ entry: m.price, side, stopPrice: s.stopPrice, mode: "deserved", tickSize: tick, liquidationLevels: fuel, sigma1h: vol.sigma1h, random: () => 0.5 });
+    };
+    expect(PROBE.positions.length).toBe(230);
+    const ethLong = pick("ETHUSDT", "ETH", "buy", 0.01);
+    expect(ethLong.source).toBe("liquidation-cluster");
+    const ec = ethLong.scored.find((c) => c.price === ethLong.price && c.kind === "liquidation-cluster")!.cluster!;
+    expect(ec.notionalUsd / 1e6).toBeCloseTo(11.2, 1);
+    expect(ec.traders).toBe(2);
+    expect(Math.round(ec.share * 100)).toBe(66);
+    expect((ec.nearEdge - 1598.96) / 1598.96).toBeCloseTo(0.0627, 3);
+    const btcShort = pick("BTCUSDT", "BTC", "sell", 0.1);
+    expect(btcShort.source).toBe("liquidation-cluster");
+    const bc = btcShort.scored.find((c) => c.price === btcShort.price && c.kind === "liquidation-cluster")!.cluster!;
+    expect(["2.3", "5.9", "18.6"]).toContain((bc.notionalUsd / 1e6).toFixed(1));
+    expect(bc.traders).toBeGreaterThanOrEqual(3);
+    expect(bc.share).toBeLessThanOrEqual(0.9);
+  });
+});
+
+describe("anti-chase guard (A12, E10)", () => {
+  const sigma1121 = realizedVol1h(K1121.map((k) => k.close)).sigma1h;
+  const sigma1120 = realizedVol1h(K1120.map((k) => k.close)).sigma1h;
+
+  it("(a) 2026-11-21 ETH: a Short at 1,598.96 is refused (10.3% in a day, below the 3-day low); a Long is allowed", () => {
+    const s = chaseCheck(1598.96, "sell", K1121, sigma1121, undefined, { asOf: AS_OF_1121, coin: "ETH" });
+    expect(s).toMatchObject({ chase: true, edge: true, fast: true });
+    expect(s.sentence).toBe("ETH fell 10.3% in a day, below its 3-day low.\nA Short here would follow the move at its edge.");
+    expect(s.numbers).toMatchObject({ low72: 1608.55, high72: 1835.18, high24: 1782.14, candles: 72 }); // the 19:00 candle was still forming
+    expect(s.numbers!.fastThreshold).toBeCloseTo(0.063, 3);
+    expect(chaseCheck(1598.96, "buy", K1121, sigma1121, undefined, { asOf: AS_OF_1121, coin: "ETH" }).chase).toBe(false);
+  });
+
+  it("(b) 2026-11-20 01:31Z ETH: the Short at 1,764.96 was not a chase (30% up its range, 2.9% below the 24 h high against 4.6%)", () => {
+    const s = chaseCheck(1764.96, "sell", K1120, sigma1120, undefined, { asOf: AS_OF_1120, coin: "ETH" });
+    expect(s).toMatchObject({ chase: false, edge: false, fast: false, sentence: null });
+    expect(s.numbers!.position).toBeCloseTo(0.297, 3);
+    expect(s.numbers!.dayMove).toBeCloseTo(0.0287, 4);
+    expect(s.numbers!.fastThreshold).toBeCloseTo(0.046, 3);
+  });
+
+  it("(c) a Patient Short waiting 3% above the 2026-11-21 price is not a chase (the entry, not the price, is judged)", () => {
+    const s = chaseCheck(1598.96 * 1.03, "sell", K1121, sigma1121, undefined, { asOf: AS_OF_1121, coin: "ETH" });
+    expect(s.chase).toBe(false);
+    expect(s.edge).toBe(false);
+  });
+
+  // Synthetic candles: 72 hours, one per hour, made up here.
+  const candles = (path: (h: number) => number) =>
+    Array.from({ length: 72 }, (_, h) => {
+      const c = path(h);
+      return { openTime: h * 3_600_000, high: c * 1.001, low: c * 0.999, close: c };
+    });
+
+  it("(d) an edge without speed (a slow 3-day drift to the low, 1% in the last day) is allowed", () => {
+    const k = candles((h) => (h < 48 ? 1700 - (85 * h) / 47 : 1615 - (15 * (h - 48)) / 23));
+    const s = chaseCheck(1599, "sell", k, 0.006, undefined, { coin: "ETH" });
+    expect(s.edge).toBe(true);
+    expect(s.fast).toBe(false);
+    expect(s.numbers!.dayMove).toBeLessThan(0.015);
+    expect(s.chase).toBe(false);
+  });
+
+  it("(e) speed without an edge (a 7% drop that bounced back to mid-range) is allowed", () => {
+    const k = candles((h) => (h < 10 ? 1600 + h * 20 : h < 60 ? 1800 : h < 64 ? 1800 - (h - 59) * 31.5 : 1700));
+    const s = chaseCheck(1700, "sell", k, 0.006, undefined, { coin: "ETH" });
+    expect(s.fast).toBe(true);
+    expect(s.edge).toBe(false);
+    expect(s.numbers!.position).toBeCloseTo(0.5, 1);
+    expect(s.chase).toBe(false);
+  });
+
+  it("(f) chase.enabled false never refuses; the numbers and the sentence are still there for the log", () => {
+    const s = chaseCheck(1598.96, "sell", K1121, sigma1121, { ...DEFAULT_RULES.chase, enabled: false }, { asOf: AS_OF_1121, coin: "ETH" });
+    expect(s).toMatchObject({ chase: false, edge: true, fast: true, enabled: false });
+    expect(s.sentence).toContain("10.3%");
+    expect(s.numbers).not.toBeNull();
+  });
+
+  it("too few completed candles: the guard cannot judge and says so (negative)", () => {
+    const s = chaseCheck(1598.96, "sell", K1121.slice(0, 10), sigma1121, undefined, { coin: "ETH" });
+    expect(s.chase).toBe(false);
+    expect(s.note).toMatch(/too few completed one-hour candles \(10\)/);
+  });
+});
+
+describe("wording: the position and every price's action (A13, E11)", () => {
+  const E = 1805.73;
+  const buy = { entry: E, side: "buy" as const, stopPrice: 1758.19, mode: "deserved" as const, tickSize: 0.01, sigma1h: 0.007, random: () => 0.5 };
+  const sell = { ...buy, side: "sell" as const, stopPrice: 1853.27 };
+  const S = (price: number, weightUsd: number): LiquidationLevel => ({ price, weightUsd, positionSide: "short" });
+  const fuelB = [S(1901.5, 150_000), S(1950.4, 900_000), S(1951.1, 800_000), S(1951.9, 800_000)];
+  const longs = [
+    pickTakeProfit(buy),
+    pickTakeProfit({ ...buy, liquidationLevels: fuelB }),
+    pickTakeProfit({ ...buy, liquidationLevels: fuelB, sigma1h: 0.0045 }),
+    pickTakeProfit({ ...buy, mode: "greedy", liquidationLevels: [S(2000.5, 250_000), S(2001.2, 150_000)] }),
+    pickTakeProfit({ ...buy, oppositeVolume: [{ price: 1902, weightUsd: 4_000_000 }], liquidationLevels: [S(1925, 300_000)] }),
+    pickTakeProfit({ ...buy, sigma1h: 0.002, liquidationLevels: [S(1995, 15_000_000), S(1995.5, 15_000_000)] }),
+    pickTakeProfit({ ...buy, liquidationLevels: [S(1897, 3_000_000), S(1897.4, 2_000_000)] }),
+    pickTakeProfit({ ...buy, liquidationLevels: fuelB, fuelMap: "unavailable" }),
+    chooseTarget({ candidates: [], brakes: [], entry: E, stopPrice: 1758.19, side: "buy", mode: "deserved", tickSize: 0.01, sigma1h: 0.007 }),
+  ];
+  const shorts = [
+    pickTakeProfit(sell),
+    pickTakeProfit({ ...sell, liquidationLevels: [{ price: 1699.6, weightUsd: 1_200_000, positionSide: "long" }, { price: 1699.1, weightUsd: 800_000, positionSide: "long" }] }),
+  ];
+
+  it("every reason of the E1 picks opens with the position, its entry and the take profit's action", () => {
+    for (const p of [...longs, ...shorts]) expect(p.reason).toMatch(/^(Long|Short) from [\d,.]+; take profit \((sell|buy back)\) at /);
+    for (const p of longs) {
+      expect(p.reason.startsWith("Long from 1,805.73; take profit (sell) at ")).toBe(true);
+      expect(p.reason).not.toContain("(buy back)");
+    }
+    for (const p of shorts) {
+      expect(p.reason.startsWith("Short from 1,805.73; take profit (buy back) at ")).toBe(true);
+      expect(p.reason).not.toContain("(sell)");
+      expect(p.reason).toContain("(buy back at 1,853.27)");
+    }
+  });
+
+  it("the summary line of the 01:31Z ETH Short is exactly the A13 headline", () => {
+    expect(planHeadline({ symbol: "ETHUSDT", side: "sell", entry: 1764.96, takeProfit: 1667.52, ratio: 2.293294, stop: 1807.46 })).toBe("ETH Short from 1,764.96, buy back 1,667.52 (2.29x), stop 1,807.46");
+    expect(planHeadline({ symbol: "BTCUSDT", side: "buy", entry: 62438.7, takeProfit: 65343.3, ratio: 1.932, stop: 60935 })).toBe("BTC Long from 62,438.7, sell 65,343.3 (1.93x), stop 60,935");
+  });
+});
+
+describe("withSymbolLeverage keeps the breadth sentence (architect's review 2026-11-21)", () => {
+  it("a lone account's cluster that would have won is still named after the stop is pulled in (33x on a 30x plan)", () => {
+    const ETHR: SymbolRules = { symbol: "ETHUSDT", tickSize: 0.01, stepSize: 0.001, minQty: 0.001, marketStepSize: 0.001, marketMinQty: 0.001, minNotionalUsd: 5 };
+    const plan = buildSetPlan({
+      input: { symbol: "ETHUSDT", side: "buy", ticketUsd: 10, leverage: 30, tpMode: "deserved", entryMode: "now" },
+      currentPrice: 1765,
+      rules: ETHR,
+      levels: NO_LEVELS,
+      random: () => 0.5,
+      market: { sigma1h: 0.00626, fuel: { status: "ok", levels: [{ price: 1908.34, weightUsd: 25_000_000, positionSide: "short" }] } },
+    });
+    expect(plan.takeProfit.reason).toContain("a $25M cluster at 1,908.34 was one account's and does not count");
+    expect(plan.takeProfit.wouldHaveWon?.cluster?.notionalUsd).toBe(25_000_000);
+    expect(plan.takeProfit.basis?.rejected).toHaveLength(1);
+    const w = withSymbolLeverage(plan, ETHR, 33);
+    expect(w.stop.price).toBeGreaterThan(plan.stop.price);
+    expect(w.takeProfit.reason).toContain("a $25M cluster at 1,908.34 was one account's and does not count");
+    expect(w.takeProfit.reason).toContain("re-chosen for the symbol's 33x");
+    expect(w.takeProfit.wouldHaveWon?.cluster?.nearEdge).toBe(1908.34);
   });
 });

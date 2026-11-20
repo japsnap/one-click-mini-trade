@@ -7,6 +7,7 @@ export * from "./rounding";
 export * from "./liquidation";
 export * from "./stop";
 export * from "./takeProfit";
+export * from "./chase";
 export * from "./nudge";
 export * from "./entry";
 export * from "./drawSplit";

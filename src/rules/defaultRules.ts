@@ -37,20 +37,32 @@ export const DEFAULT_RULES = {
     volFloor: 0.002,
     /** A level with a smaller chance than this of being reached is dropped. */
     minReach: 0.03,
-    /** Width of one band of liquidation prices, as a share of the entry price. */
-    fuelBandWidth: 0.001,
-    /** Neighbouring bands merge into one cluster up to this many bands wide. */
-    fuelMaxBands: 5,
     /** A cluster counts only when this many USD of positions get liquidated in it. */
     fuelMinUsd: 100_000,
+    /** A cluster is every liquidation price within this share of its nearest one (1.5%). */
+    fuelClusterWidth: 0.015,
+    /** A cluster needs at least this many separate accounts (one trader is not a crowd). */
+    fuelMinTraders: 2,
+    /** The largest account may hold at most this share of a cluster's money. */
+    fuelMaxShare: 0.9,
+    /** Without its largest account, a cluster must still hold this many USD. */
+    fuelMinRestUsd: 100_000,
     /** The target sits this far inside a cluster's near edge, as a share of the price. */
     fuelInset: 0.0005,
     /** Score bonus per extra trader in a cluster (up to 4 extra), for many separate liquidations. */
     fuelDensityBonus: 0.1,
     /** How many Hyperliquid accounts (by 30-day volume) the liquidation map reads; 0 turns it off. */
     fuelMapTopN: 600,
-    /** The liquidation map is read again every this many minutes, in the background. */
+    /** While a card is open, the whole liquidation map is read again over this many minutes. */
     fuelMapRefreshMinutes: 5,
+    /** First read of the map: this many of the biggest accounts, read at once (the quick map). */
+    fuelMapQuickN: 200,
+    /** A preview waits at most this long, in milliseconds, for the quick map. */
+    fuelMapWaitMs: 8_000,
+    /** One account's answer counts as fresh for this many minutes. */
+    fuelMapTtlMinutes: 5,
+    /** The map stops reading after this many minutes without a preview, level read or place. */
+    fuelMapIdleMinutes: 10,
     /** A wall, round number or swing high pulls half as much as a cluster of the same size. */
     brakeWeight: 0.5,
     /** The score is multiplied by this for each wall, round number or swing high in the way (at most 3). */
@@ -69,6 +81,16 @@ export const DEFAULT_RULES = {
     wallJitter: 0.0003,
     /** Candles looked at for the recent high (Buy) or low (Sell): one-hour and four-hour. */
     swingLookback: { "1h": 48, "4h": 42 },
+  },
+  chase: {
+    /** Refuse a Set that follows a move already at the edge of its range (owner's hard rule 2026-11-21). */
+    enabled: true,
+    /** "At the edge": the entry sits in this outer share of the last 72 hours' low-to-high range. */
+    edgeShare: 0.1,
+    /** The range counts only when it is at least this share of the price. */
+    minRange: 0.03,
+    /** "Fast": the entry is this many typical days' moves beyond the last 24 hours' other extreme. */
+    daySigmas: 1.5,
   },
   entry: {
     /** The entry choice a new card starts on: now, nearby, patient or draw. */

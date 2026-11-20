@@ -157,7 +157,12 @@ describe("Rule set: the target v2 knobs (Sets_Rules.md A, 2026-11-20)", () => {
     expect([t.ratioSlack, t.windowTop, t.volLookbackHours, t.volFloor, t.minReach]).toEqual([0.1, 2, 72, 0.002, 0.03]);
     expect(t.horizonHours).toEqual({ shy: 24, deserved: 48, greedy: 96 });
     expect(t.rewardPower).toEqual({ shy: 0.5, deserved: 1, greedy: 1.5 });
-    expect([t.fuelBandWidth, t.fuelMaxBands, t.fuelMinUsd, t.fuelInset, t.fuelDensityBonus, t.fuelMapTopN, t.fuelMapRefreshMinutes]).toEqual([0.001, 5, 100_000, 0.0005, 0.1, 600, 5]);
+    expect([t.fuelMinUsd, t.fuelInset, t.fuelDensityBonus, t.fuelMapTopN, t.fuelMapRefreshMinutes]).toEqual([100_000, 0.0005, 0.1, 600, 5]);
+    // A10 and A11 (2026-11-21).
+    expect([t.fuelClusterWidth, t.fuelMinTraders, t.fuelMaxShare, t.fuelMinRestUsd]).toEqual([0.015, 2, 0.9, 100_000]);
+    expect([t.fuelMapQuickN, t.fuelMapWaitMs, t.fuelMapTtlMinutes, t.fuelMapIdleMinutes]).toEqual([200, 8000, 5, 10]);
+    expect(DEFAULT_RULES.chase).toEqual({ enabled: true, edgeShare: 0.1, minRange: 0.03, daySigmas: 1.5 });
+    expect("fuelBandWidth" in t || "fuelMaxBands" in t).toBe(false);
     expect([t.brakeWeight, t.brakePass, t.brakeShadow, t.sameSpotGap]).toEqual([0.5, 0.8, 0.003, 0.001]);
     expect([t.wallMinUsd, t.wallBandWidth, t.wallFrontGap, t.wallJitter]).toEqual([25_000, 0.0005, 0.0003, 0.0003]);
     expect(t.swingLookback).toEqual({ "1h": 48, "4h": 42 });
@@ -170,8 +175,14 @@ describe("Rule set: the target v2 knobs (Sets_Rules.md A, 2026-11-20)", () => {
       ["volLookbackHours", 1], ["volLookbackHours", 1001], ["volLookbackHours", 72.5],
       ["volFloor", 0], ["volFloor", 0.11],
       ["minReach", -0.01], ["minReach", 0.51],
-      ["fuelBandWidth", 0], ["fuelBandWidth", 0.06],
-      ["fuelMaxBands", 0], ["fuelMaxBands", 51], ["fuelMaxBands", 2.5],
+      ["fuelClusterWidth", 0.0009], ["fuelClusterWidth", 0.051],
+      ["fuelMinTraders", 0], ["fuelMinTraders", 21], ["fuelMinTraders", 2.5],
+      ["fuelMaxShare", 0.49], ["fuelMaxShare", 1.01],
+      ["fuelMinRestUsd", -1], ["fuelMinRestUsd", 1e11],
+      ["fuelMapQuickN", -1], ["fuelMapQuickN", 2001], ["fuelMapQuickN", 1.5],
+      ["fuelMapWaitMs", -1], ["fuelMapWaitMs", 30_001],
+      ["fuelMapTtlMinutes", 0.5], ["fuelMapTtlMinutes", 61],
+      ["fuelMapIdleMinutes", 0.5], ["fuelMapIdleMinutes", 1441],
       ["fuelMinUsd", -1], ["fuelMinUsd", 1e11],
       ["fuelInset", -0.001], ["fuelInset", 0.06],
       ["fuelDensityBonus", -0.1], ["fuelDensityBonus", 2.1],
@@ -183,6 +194,13 @@ describe("Rule set: the target v2 knobs (Sets_Rules.md A, 2026-11-20)", () => {
       ["sameSpotGap", -0.001], ["sameSpotGap", 0.06],
     ];
     for (const [k, v] of cases) expect(() => mergeRules({ target: { [k]: v } }), `${k} = ${v}`).toThrow(new RegExp(`"target\\.${k}"`));
+    // The anti-chase guard's own group (A12).
+    const chase: Array<[string, unknown]> = [["edgeShare", -0.01], ["edgeShare", 0.51], ["daySigmas", -0.1], ["daySigmas", 5.1], ["minRange", -0.01], ["minRange", 0.51], ["enabled", "yes"], ["enabled", 1]];
+    for (const [k, v] of chase) expect(() => mergeRules({ chase: { [k]: v } }), `chase.${k} = ${v}`).toThrow(new RegExp(`"chase\\.${k}"`));
+    expect(mergeRules({ chase: { enabled: false, edgeShare: 0.5, daySigmas: 5 } }).chase).toEqual({ enabled: false, edgeShare: 0.5, minRange: 0.03, daySigmas: 5 });
+    // The quick map can never be bigger than the map (a contradiction, refused).
+    expect(() => mergeRules({ target: { fuelMapTopN: 100 } })).toThrow(/"target.fuelMapQuickN" must not be above "target.fuelMapTopN"/);
+    expect(mergeRules({ target: { fuelMapTopN: 100, fuelMapQuickN: 100 } }).target.fuelMapQuickN).toBe(100);
     const maps: Array<[string, string, unknown]> = [
       ["horizonHours", "deserved", 0.5], ["horizonHours", "greedy", 721],
       ["rewardPower", "greedy", -0.1], ["rewardPower", "shy", 3.1],
@@ -202,7 +220,17 @@ describe("Rule set: the target v2 knobs (Sets_Rules.md A, 2026-11-20)", () => {
     setActiveRules(mergeRules({ target: { minReach: 0.5 } }));
     const strict = at();
     expect(strict.takeProfit.source).toBe("exact-ratio"); // nothing has a 50% chance
-    expect(strict.takeProfit.reason).toMatch(/^the bare 2x/);
+    expect(strict.takeProfit.reason).toMatch(/^Long from 64,000; take profit \(sell\) at [0-9,.]+, 2x the stop \(sell at [0-9,.]+\): the bare 2x/);
+  });
+
+  it("the old band keys fuelBandWidth and fuelMaxBands (retired 2026-11-21 by the 1.5% clusters) still load and are ignored", () => {
+    const r = mergeRules({ target: { fuelBandWidth: 0.001, fuelMaxBands: 5 } });
+    expect(r).toEqual(DEFAULT_RULES);
+    expect(() => mergeRules({ target: { fuelMaxBands: "5" } })).toThrow(/"target.fuelMaxBands": must be a number/);
+    const dir = mkdtempSync(path.join(tmpdir(), "set-rules-bands-"));
+    const file = path.join(dir, "bands.json");
+    writeFileSync(file, JSON.stringify({ target: { fuelBandWidth: 0.002, fuelMaxBands: 3 } }));
+    expect(loadRulesFile({ SETS_RULES_FILE: file }, dir).ignored).toEqual(["target.fuelBandWidth (replaced by target.fuelClusterWidth)", "target.fuelMaxBands (replaced by target.fuelClusterWidth)"]);
   });
 
   it("the old keys wallSearchReach and roundNumberReach still load and are ignored (deprecation window); the loader names them", () => {

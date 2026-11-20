@@ -193,9 +193,14 @@ export interface FuelCluster {
   nearEdge: number;
   farEdge: number;
   notionalUsd: number;
-  /** Positions in the cluster (one position per trader and coin on Hyperliquid). */
+  /** Accounts in the cluster (one position per account and coin on Hyperliquid). */
   traders: number;
-  bands: number;
+  /** The largest account's money, the rest, and the largest's share of the whole (A11). */
+  largestUsd: number;
+  restUsd: number;
+  share: number;
+  /** Why it is not a crowd, or null when it qualifies. */
+  failed: null | "one account" | "mostly one account" | "too small";
 }
 
 /** One level the target may use (A3). price is already on the tick. */
@@ -246,6 +251,9 @@ export interface TargetCounts {
   clustersFound: number;
   clustersTooSmall: number;
   clustersBelowSlackLine: number;
+  /** Clusters dropped by breadth (A11): a single account, or one account's money with crumbs. */
+  clustersLoneTrader: number;
+  clustersWhaleOnly: number;
   /** Opposite-side resting orders handed in (Aster book plus traders' limits), and inside the window. */
   levelsRead: number;
   levelsInWindow: number;
@@ -264,6 +272,8 @@ export interface TargetCounts {
   fuelMap: "ok" | "unavailable";
   /** Why the map is unavailable ("thin: 12 of 600 accounts", "not read yet ..."), or null. */
   fuelMapNote: string | null;
+  /** The map was still being read when the plan was built: "liquidation map: 143 of 600 accounts, still reading" (A10). */
+  fuelMapReading: string | null;
   winner: null | { kind: string; pull: number; reach: number; pass: number; score: number };
 }
 
@@ -277,6 +287,8 @@ export interface TargetBasis {
   /** Top candidates by score at plan time, and every brake of the window. */
   candidates: TargetCandidate[];
   brakes: Brake[];
+  /** Clusters that failed breadth (A11), so a re-choice can still name one that would have won. Missing in older ledgers. */
+  rejected?: TargetCandidate[];
 }
 
 /** Result of chooseTarget (and of pickTakeProfit, which adds the collection counts). */
@@ -302,6 +314,8 @@ export interface TakeProfitPick {
   counts: TargetCounts;
   /** The brake the target was moved in front of after the pick (A5), if any. */
   pulledInFrontOf: Brake | null;
+  /** A cluster that failed breadth (A11) but outscored the winner: named in the reason. */
+  wouldHaveWon?: ScoredCandidate | null;
   basis: TargetBasis;
 }
 
@@ -332,6 +346,8 @@ export interface PickTakeProfitInput {
   fuelMap?: "ok" | "unavailable";
   /** Why it is unavailable, carried into the reason (for example "thin: 12 of 600 accounts"). */
   fuelMapNote?: string | null;
+  /** Set while the map is still being read (A10); ends the reason. */
+  fuelMapReading?: string | null;
   /** One draw for the jitter in front of a brake. Default: no jitter (always 0.5). */
   random?: RandomSource;
   /** Optional override of the mode's floor (must be >= 1). */
@@ -386,11 +402,13 @@ export function frontOfBrake(brakePrice: number, side: Side, tickSize: number, r
 // ---------------------------------------------------------------------------
 
 /** Counts of the collection step. */
-export type CollectCounts = Omit<TargetCounts, "candidatesScored" | "candidatesOutOfReach" | "candidatesOutsideWindow" | "sigma1h" | "sigmaSource" | "horizonHours" | "fuelMap" | "fuelMapNote" | "winner">;
+export type CollectCounts = Omit<TargetCounts, "candidatesScored" | "candidatesOutOfReach" | "candidatesOutsideWindow" | "sigma1h" | "sigmaSource" | "horizonHours" | "fuelMap" | "fuelMapNote" | "fuelMapReading" | "winner">;
 
 /** Output of collectTargetCandidates. */
 export interface CollectedTargets {
   candidates: TargetCandidate[];
+  /** Clusters that fail breadth (A11), placed like candidates but kept out of the race. */
+  rejected: TargetCandidate[];
   brakes: Brake[];
   clusters: FuelCluster[];
   window: TargetWindow;
@@ -488,11 +506,14 @@ export function collectTargetCandidates(args: {
   }
   brakes.sort((a, b) => d(a.price) - d(b.price));
 
-  // ---- fuel clusters ----
+  // ---- fuel clusters (A11: breadth) ----
+  // A cluster is every profit-side liquidation level within fuelClusterWidth (1.5%) of the
+  // cluster's nearest level, nearest first, greedy. It counts only as a crowd: at least
+  // fuelMinUsd, fuelMinTraders accounts, the largest at most fuelMaxShare of the money, and
+  // the rest at least fuelMinRestUsd. One level = one account (one position per coin).
   const wanted = side === "buy" ? "short" : "long";
   const fuel = args.fuelLevels ?? [];
-  const fw = entry * t.fuelBandWidth;
-  const fb = new Map<number, { usd: number; n: number; near: number; far: number }>();
+  const usable: LiquidationLevel[] = [];
   let onSide = 0;
   let fuelInWindow = 0;
   for (const l of fuel) {
@@ -502,38 +523,47 @@ export function collectTargetCandidates(args: {
     onSide++;
     if (dist > dTop) continue;
     if (dist >= dLine) fuelInWindow++;
-    const k = Math.floor(dist / fw + 1e-9);
-    const b = fb.get(k);
-    if (b) fb.set(k, { usd: b.usd + l.weightUsd, n: b.n + 1, near: d(l.price) < d(b.near) ? l.price : b.near, far: d(l.price) > d(b.far) ? l.price : b.far });
-    else fb.set(k, { usd: l.weightUsd, n: 1, near: l.price, far: l.price });
+    usable.push(l);
   }
-  const keys = [...fb.keys()].sort((a, b) => a - b);
+  usable.sort((a, b) => d(a.price) - d(b.price));
   const clusters: FuelCluster[] = [];
+  const failing: FuelCluster[] = [];
   let tooSmall = 0;
   let belowLine = 0;
-  for (let i = 0; i < keys.length; ) {
-    // One run of neighbouring non-empty bands, cut into pieces of at most fuelMaxBands.
-    const chunk: number[] = [keys[i] as number];
-    let j = i + 1;
-    while (j < keys.length && (keys[j] as number) === (keys[j - 1] as number) + 1 && chunk.length < t.fuelMaxBands) chunk.push(keys[j++] as number);
+  let lone = 0;
+  let whale = 0;
+  for (let i = 0; i < usable.length; ) {
+    const first = usable[i] as LiquidationLevel;
+    const members: LiquidationLevel[] = [];
+    let j = i;
+    while (j < usable.length && (d((usable[j] as LiquidationLevel).price) - d(first.price)) / first.price <= t.fuelClusterWidth + 1e-12) members.push(usable[j++] as LiquidationLevel);
     i = j;
-    const parts = chunk.map((k) => fb.get(k) as { usd: number; n: number; near: number; far: number });
+    const notionalUsd = members.reduce((x, m) => x + m.weightUsd, 0);
+    const largestUsd = Math.max(...members.map((m) => m.weightUsd));
     const c: FuelCluster = {
-      nearEdge: (parts[0] as { near: number }).near,
-      farEdge: (parts[parts.length - 1] as { far: number }).far,
-      notionalUsd: parts.reduce((x, p) => x + p.usd, 0),
-      traders: parts.reduce((x, p) => x + p.n, 0),
-      bands: chunk.length,
+      nearEdge: first.price,
+      farEdge: (members[members.length - 1] as LiquidationLevel).price,
+      notionalUsd,
+      traders: members.length,
+      largestUsd,
+      restUsd: notionalUsd - largestUsd,
+      share: largestUsd / notionalUsd,
+      failed: null,
     };
-    if (c.notionalUsd < t.fuelMinUsd) {
+    if (d(c.farEdge) < dLine) {
+      if (notionalUsd >= t.fuelMinUsd) belowLine++;
+      continue; // wholly inside the slack line: never a target
+    }
+    if (c.traders < t.fuelMinTraders) c.failed = "one account";
+    else if (notionalUsd < t.fuelMinUsd) c.failed = "too small";
+    else if (c.share > t.fuelMaxShare + 1e-12 || c.restUsd < t.fuelMinRestUsd) c.failed = "mostly one account";
+    if (c.failed === "too small" || (c.failed === "one account" && notionalUsd < t.fuelMinUsd)) {
       tooSmall++;
       continue;
     }
-    if (d(c.farEdge) < dLine) {
-      belowLine++;
-      continue; // wholly inside the slack line: never a target
-    }
-    clusters.push(c);
+    if (c.failed === "one account") lone++;
+    if (c.failed === "mostly one account") whale++;
+    (c.failed ? failing : clusters).push(c);
   }
 
   // ---- candidates ----
@@ -548,19 +578,22 @@ export function collectTargetCandidates(args: {
     return { price: roundKeepingLine(p, side, tickSize, dLine, d), clamped };
   };
   let clampedPast = 0;
-  for (const c of clusters) {
+  const rejected: TargetCandidate[] = [];
+  for (const c of [...clusters, ...failing]) {
     let raw = c.nearEdge * (1 - g.sign * t.fuelInset);
     // A brake just in front of the edge: the target goes in front of the first such brake.
     const shadow = brakes.find((b) => d(b.price) <= d(c.nearEdge) && (d(c.nearEdge) - d(b.price)) / c.nearEdge <= t.brakeShadow);
     if (shadow) raw = frontOfBrake(shadow.price, side, tickSize, r, t);
     const pl = place(raw);
     if (pl.clamped && d(pl.price) > d(c.farEdge)) {
-      clampedPast++;
+      if (!c.failed) clampedPast++;
       continue; // the clamp lands beyond the cluster's far edge: dropped (A3)
     }
     const pull = Math.log2(1 + c.notionalUsd / t.fuelMinUsd) * (1 + t.fuelDensityBonus * Math.min(c.traders - 1, 4));
     // Clamped to the line: the target no longer sits in front of the shadowing brake, so it is not named as such.
-    candidates.push({ kind: "liquidation-cluster", price: pl.price, pull, weightUsd: c.notionalUsd, traders: c.traders, brake: pl.clamped ? null : (shadow ?? null), cluster: c, clamped: pl.clamped });
+    const cand: TargetCandidate = { kind: "liquidation-cluster", price: pl.price, pull, weightUsd: c.notionalUsd, traders: c.traders, brake: pl.clamped ? null : (shadow ?? null), cluster: c, clamped: pl.clamped };
+    // A cluster that fails breadth never enters the race; it is scored aside so the reason can name it when it would have won.
+    (c.failed ? rejected : candidates).push(cand);
   }
   for (const b of brakes) {
     if (d(b.price) < dLine - 1e-9) continue; // inside the slack line: only watched by A5
@@ -571,6 +604,7 @@ export function collectTargetCandidates(args: {
 
   return {
     candidates,
+    rejected,
     brakes,
     clusters,
     window,
@@ -581,6 +615,8 @@ export function collectTargetCandidates(args: {
       clustersFound: clusters.length - clampedPast,
       clustersTooSmall: tooSmall,
       clustersBelowSlackLine: belowLine + clampedPast,
+      clustersLoneTrader: lone,
+      clustersWhaleOnly: whale,
       levelsRead: (args.bookLevels ?? []).length,
       levelsInWindow,
       walls,
@@ -619,10 +655,13 @@ export function chooseTarget(args: {
   r?: number;
   fuelMap?: "ok" | "unavailable";
   fuelMapNote?: string | null;
+  fuelMapReading?: string | null;
   minRatioOverride?: number;
   rules?: SetRules;
   /** Counts of the collection step, carried into the result. */
   collected?: CollectCounts;
+  /** Clusters that failed breadth (A11): named in the reason when one would have won. */
+  rejected?: TargetCandidate[];
 }): TakeProfitPick {
   const t = (args.rules ?? activeRules()).target;
   const floor = args.minRatioOverride ?? t[args.mode];
@@ -638,7 +677,7 @@ export function chooseTarget(args: {
   const sigma = Math.max(args.sigma1h ?? 0, t.volFloor);
   const fuelMap = args.fuelMap ?? "ok";
 
-  const scored: ScoredCandidate[] = args.candidates.map((c) => {
+  const score = (c: TargetCandidate): ScoredCandidate => {
     const ratio = ratioOf(c.price);
     const reach = reachChance(d(c.price) / entry, sigma, H);
     const inWay = args.brakes.filter((b) => STALLS.includes(b.kind) && d(b.price) > dLine + 1e-9 && d(b.price) < d(c.price) - 1e-9).length;
@@ -649,11 +688,15 @@ export function chooseTarget(args: {
     else if (ratio > g.hi + 1e-9) dropped = "beyond the window top";
     else if (reach < t.minReach) dropped = "out of reach";
     return { ...c, ratio, reach, pass, brakesInWay: inWay, reward, score: c.pull * reach * pass * reward, dropped };
-  });
+  };
+  const scored: ScoredCandidate[] = args.candidates.map(score);
   const live = scored.filter((c) => c.dropped === null);
+  // Clusters that failed breadth (A11), scored on the same terms but never in the race.
+  const rejectedScored = (args.rejected ?? []).map(score).filter((c) => c.dropped === null).sort((a, b) => b.score - a.score);
   // Highest score first; a tie goes to the nearer level (reached sooner).
   live.sort((a, b) => (Math.abs(b.score - a.score) > 1e-12 ? b.score - a.score : d(a.price) - d(b.price)));
   const best = live[0] ?? null;
+  const wouldHaveWon = rejectedScored[0] && (!best || rejectedScored[0].score > best.score) ? rejectedScored[0] : null;
 
   let price: number;
   let source: TpSource;
@@ -692,6 +735,8 @@ export function chooseTarget(args: {
       clustersFound,
       clustersTooSmall: 0,
       clustersBelowSlackLine: 0,
+      clustersLoneTrader: 0,
+      clustersWhaleOnly: 0,
       levelsRead: 0,
       levelsInWindow: 0,
       walls: args.brakes.filter((b) => b.kind === "wall").length,
@@ -708,6 +753,7 @@ export function chooseTarget(args: {
     horizonHours: H,
     fuelMap,
     fuelMapNote: fuelMap === "unavailable" ? (args.fuelMapNote ?? null) : null,
+    fuelMapReading: args.fuelMapReading ?? null,
     winner: best ? { kind: best.kind, pull: round4(best.pull), reach: round4(best.reach), pass: round4(best.pass), score: round4(best.score) } : null,
   };
   const top5 = live.slice(0, 5);
@@ -725,9 +771,10 @@ export function chooseTarget(args: {
     window,
     counts,
     pulledInFrontOf,
-    basis: { mode: args.mode, floor, sigma1h: sigma, horizonHours: H, fuelMap, candidates: top5.map(stripScore), brakes: args.brakes },
+    basis: { mode: args.mode, floor, sigma1h: sigma, horizonHours: H, fuelMap, candidates: top5.map(stripScore), brakes: args.brakes, rejected: args.rejected ?? [] },
   };
-  pick.reason = targetReason({ pick, best, side, tickSize, stuckBehind, clustersFound, scored });
+  pick.wouldHaveWon = wouldHaveWon;
+  pick.reason = targetReason({ pick, best, side, tickSize, stuckBehind, clustersFound, scored, entry, wouldHaveWon });
   return pick;
 }
 
@@ -741,7 +788,7 @@ function round4(x: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// A9: the sentence
+// A9 and A13: the sentence
 // ---------------------------------------------------------------------------
 
 /** "1,949.41": thousands separators, at most the tick's decimals. */
@@ -760,9 +807,19 @@ function fmtX(x: number): string {
   return `${Number(x.toFixed(2))}x`;
 }
 
+/**
+ * The words of a position (A13, owner's correction 2026-11-21: "ETH sell: 1,667.52" read as
+ * selling at 1,667). A Buy is a Long, closed by a sale; a Sell is a Short, closed by a buy-back.
+ */
+export function positionWords(side: Side) {
+  return side === "buy"
+    ? { position: "Long", exit: "sell", noun: "sale", orders: "sell orders", liquidated: "shorts" }
+    : { position: "Short", exit: "buy back", noun: "buy-back", orders: "buy orders", liquidated: "longs" };
+}
+
 /** How a brake reads in a sentence. */
 function brakePhrase(b: Brake, side: Side, tickSize: number, withResting: boolean): string {
-  const orders = side === "buy" ? "sell orders" : "buy orders";
+  const orders = positionWords(side).orders;
   const at = fmtPrice(b.price, tickSize);
   switch (b.kind) {
     case "round-number":
@@ -776,12 +833,12 @@ function brakePhrase(b: Brake, side: Side, tickSize: number, withResting: boolea
   }
 }
 
-/** The cluster in words: "$2.5M of 3 traders' shorts get liquidated (1,950.4 to 1,951.9)". */
+/** The cluster in words: "$2.5M of 3 accounts' shorts get liquidated (1,950.4 to 1,951.9; the largest holds 36%)". */
 function clusterPhrase(c: FuelCluster, side: Side, tickSize: number): string {
-  const who = c.traders === 1 ? "1 trader's" : `${c.traders} traders'`;
-  const what = side === "buy" ? "shorts" : "longs";
+  const who = c.traders === 1 ? "1 account's" : `${c.traders} accounts'`;
   const span = c.nearEdge === c.farEdge ? fmtPrice(c.nearEdge, tickSize) : `${fmtPrice(c.nearEdge, tickSize)} to ${fmtPrice(c.farEdge, tickSize)}`;
-  return `${fmtUsdShort(c.notionalUsd)} of ${who} ${what} get liquidated (${span})`;
+  const largest = c.traders > 1 ? `; the largest holds ${Math.round(c.share * 100)}%` : "";
+  return `${fmtUsdShort(c.notionalUsd)} of ${who} ${positionWords(side).liquidated} get liquidated (${span}${largest})`;
 }
 
 /** "0.075%": how far a price sits beyond a brake. */
@@ -791,10 +848,11 @@ function pctBehind(b: Brake, price: number, side: Side): string {
 }
 
 /**
- * One human sentence for a pick (A9). Forms:
- *  cluster: "target 1,949.41, just in front of 1,950 (a round number) at the edge of a cluster where $2.5M of 3 traders' shorts get liquidated (1,950.4 to 1,951.9), 3.02x the stop"
- *  brake:   "no liquidation cluster between 1.9x and 4x, so target 1,899.43, just in front of 1,900 (a round number), 1.97x the stop (floor 2x, slack 0.1x)"
- *  none:    "the bare 2x at 1,900.81: no liquidation cluster, wall, round number or swing high between 1.9x and 4x within reach"
+ * One human sentence for a pick (A9, worded by A13):
+ *   "<Long|Short> from <entry>; take profit (<sell|buy back>) at <price>, <ratio>x the stop (<sell|buy back> at <stop>): <why>"
+ * Examples:
+ *   "Long from 1,805.73; take profit (sell) at 1,949.41, 3.02x the stop (sell at 1,758.19): the sale sits just in front of 1,950 (a round number) at the edge of a cluster where $2.5M of 3 accounts' shorts get liquidated (1,950.4 to 1,951.9; the largest holds 36%)"
+ *   "Short from 1,764.96; take profit (buy back) at 1,667.52, 2.29x the stop (buy back at 1,807.46): the buy-back sits just inside a cluster where ..."
  */
 export function targetReason(a: {
   pick: TakeProfitPick;
@@ -804,46 +862,74 @@ export function targetReason(a: {
   stuckBehind: Brake | null;
   clustersFound: number;
   scored: ScoredCandidate[];
+  entry: number;
+  wouldHaveWon?: ScoredCandidate | null;
 }): string {
   const { pick, best, side, tickSize } = a;
+  const words = positionWords(side);
   const w = pick.window;
   const between = `between ${fmtX(w.lo)} and ${fmtX(w.hi)}`;
   const price = fmtPrice(pick.price, tickSize);
-  const slack = pick.ratio < w.floor - 1e-9 ? ` (floor ${fmtX(w.floor)}, slack ${fmtX(w.floor - w.lo)})` : "";
-  const ratioText = `${fmtX(pick.ratio)} the stop${slack}`;
+  const slack = pick.ratio < w.floor - 1e-9 ? `, within the ${fmtX(w.floor - w.lo)} slack of the ${fmtX(w.floor)} floor` : "";
+  const head = `${words.position} from ${fmtPrice(a.entry, tickSize)}; take profit (${words.exit}) at ${price}, ${fmtX(pick.ratio)} the stop (${words.exit} at ${fmtPrice(pick.stopPrice, tickSize)})${slack}: `;
   const pulled = pick.pulledInFrontOf ? `pulled in front of ${brakePhrase(pick.pulledInFrontOf, side, tickSize, false)}` : "";
   const stuck = a.stuckBehind ? `; it stays just behind ${brakePhrase(a.stuckBehind, side, tickSize, false)}, because in front of it would break the ${fmtX(w.lo)} line` : "";
-  const mapGone = pick.counts.fuelMap === "unavailable";
+  const reading = pick.counts.fuelMapReading ? `; ${pick.counts.fuelMapReading}` : "";
+  // "Unavailable" is said up front, unless the map is simply still being read (said at the end).
+  const mapGone = pick.counts.fuelMap === "unavailable" && !pick.counts.fuelMapReading;
   const mapText = `liquidation map unavailable${pick.counts.fuelMapNote ? ` (${pick.counts.fuelMapNote})` : ""}`;
+  const lostCluster = a.wouldHaveWon?.cluster;
+  const lost = lostCluster
+    ? `; a ${fmtUsdShort(lostCluster.notionalUsd)} cluster at ${fmtPrice(lostCluster.nearEdge, tickSize)} was ${
+        lostCluster.failed === "one account" ? "one account's" : `mostly one account's (${Math.round(lostCluster.share * 100)}%)`
+      } and does not count`
+    : "";
+  const tail = `${lost}${stuck}${reading}`;
 
   if (!best) {
-    const head = `the bare ${fmtX(w.floor)} at ${price}${pulled ? `, ${pulled}` : ""}`;
-    const what = `no liquidation cluster, wall, round number or swing high ${between} within reach`;
+    const what = `the bare ${fmtX(w.floor)}${pulled ? `, ${pulled}` : ""}: no liquidation cluster, wall, round number or swing high ${between} within reach`;
     // Name the heaviest cluster that was there but out of reach, so the choice is visible.
     const far = a.scored
       .filter((c) => c.kind === "liquidation-cluster" && c.dropped === "out of reach" && c.cluster)
       .sort((x, y) => y.weightUsd - x.weightUsd)[0];
     const farText = far?.cluster ? `; the ${fmtUsdShort(far.cluster.notionalUsd)} cluster at ${fmtPrice(far.cluster.nearEdge, tickSize)} is out of reach within ${pick.counts.horizonHours} h` : "";
-    return `${head}: ${what}${farText}${mapGone ? `; ${mapText}` : ""}${stuck}`;
+    return `${head}${what}${farText}${mapGone ? `; ${mapText}` : ""}${tail}`;
   }
 
   const prefix = mapGone ? `${mapText}, so ` : a.clustersFound === 0 ? `no liquidation cluster ${between}, so ` : "";
   if (best.kind === "liquidation-cluster" && best.cluster) {
-    const edge = best.brake ? `just in front of ${brakePhrase(best.brake, side, tickSize, false)} at the edge of` : best.clamped ? "on the slack line inside" : "just inside the edge of";
-    const head = pulled
-      ? `target ${price}: the best level was a cluster where ${clusterPhrase(best.cluster, side, tickSize)}, ${pulled}`
-      : `target ${price}, ${edge} a cluster where ${clusterPhrase(best.cluster, side, tickSize)}`;
-    return `${prefix}${head}, ${ratioText}${stuck}`;
+    const edge = best.brake ? `just in front of ${brakePhrase(best.brake, side, tickSize, false)} at the edge of` : best.clamped ? "on the slack line inside" : "just inside";
+    const why = pulled
+      ? `the best level was a cluster where ${clusterPhrase(best.cluster, side, tickSize)}, ${pulled}`
+      : `the ${words.noun} sits ${edge} a cluster where ${clusterPhrase(best.cluster, side, tickSize)}`;
+    return `${head}${prefix}${why}${tail}`;
   }
   const b = best.brake as Brake;
-  const head = pulled
-    ? `target ${price}: the best level was ${brakePhrase(b, side, tickSize, true)}, ${pulled} because it sat ${pctBehind(pick.pulledInFrontOf as Brake, best.price, side)} behind it`
+  const why = pulled
+    ? `the best level was ${brakePhrase(b, side, tickSize, true)}, ${pulled} because it sat ${pctBehind(pick.pulledInFrontOf as Brake, best.price, side)} behind it`
     : !best.clamped
-      ? `target ${price}, just in front of ${brakePhrase(b, side, tickSize, true)}`
+      ? `the ${words.noun} sits just in front of ${brakePhrase(b, side, tickSize, true)}`
       : (side === "buy" ? best.price < b.price : best.price > b.price)
-        ? `target ${price}, just in front of ${brakePhrase(b, side, tickSize, true)}, moved out to the ${fmtX(w.lo)} line`
-        : `target ${price}, on the ${fmtX(w.lo)} line just past ${brakePhrase(b, side, tickSize, true)}`;
-  return `${prefix}${head}, ${ratioText}${stuck}`;
+        ? `the ${words.noun} sits just in front of ${brakePhrase(b, side, tickSize, true)}, moved out to the ${fmtX(w.lo)} line`
+        : `the ${words.noun} sits on the ${fmtX(w.lo)} line just past ${brakePhrase(b, side, tickSize, true)}`;
+  return `${head}${prefix}${why}${tail}`;
+}
+
+/**
+ * The one-line summary of a plan for the card headline, logs and smoke reports (A13):
+ * "ETH Short from 1,764.96, buy back 1,667.52 (2.29x), stop 1,807.46". Never "<side>: <price>".
+ */
+export function planHeadline(p: { symbol: string; side: Side; entry: number; takeProfit: number; ratio: number; stop: number; tickSize?: number }): string {
+  const words = positionWords(p.side);
+  const tick = p.tickSize ?? Math.min(tickOf(p.entry), tickOf(p.takeProfit), tickOf(p.stop));
+  const coin = p.symbol.replace(/USDT$|USDC$|USD$/, "");
+  return `${coin} ${words.position} from ${fmtPrice(p.entry, tick)}, ${words.exit} ${fmtPrice(p.takeProfit, tick)} (${fmtX(p.ratio)}), stop ${fmtPrice(p.stop, tick)}`;
+}
+
+/** The finest tick a printed price needs (1,807.46 -> 0.01), at most 8 decimals. */
+function tickOf(v: number): number {
+  const dec = Math.min(8, (String(v).split(".")[1] ?? "").length);
+  return dec === 0 ? 1 : Number((10 ** -dec).toFixed(dec));
 }
 
 // ---------------------------------------------------------------------------
@@ -885,8 +971,10 @@ export function pickTakeProfit(input: PickTakeProfitInput): TakeProfitPick {
     r,
     fuelMap: input.fuelMap ?? "ok",
     fuelMapNote: input.fuelMapNote,
+    fuelMapReading: input.fuelMapReading,
     minRatioOverride: input.minRatioOverride,
     collected: collected.counts,
+    rejected: collected.rejected,
   });
 }
 
@@ -924,9 +1012,9 @@ export function remeasureAfterFill(args: {
   const s = liquidationDistance(args.fill, args.stopPrice);
   const sign = args.side === "buy" ? 1 : -1;
   const realRatio = cleanRatio((sign * (args.takeProfitPrice - args.fill)) / s);
-  const tp = fmtPrice(args.takeProfitPrice, args.tickSize);
+  const tp = `take profit (${positionWords(args.side).exit}) at ${fmtPrice(args.takeProfitPrice, args.tickSize)}`;
   if (realRatio >= lo - 1e-9) {
-    return { realRatio, lo, action: "keep", choice: null, message: `target ${tp} is ${fmtX(realRatio)} against the real fill, at or above ${fmtX(lo)}: kept` };
+    return { realRatio, lo, action: "keep", choice: null, message: `${tp} is ${fmtX(realRatio)} against the real fill, at or above ${fmtX(lo)}: kept` };
   }
   const choice = chooseTarget({
     candidates: args.basis.candidates,
@@ -940,9 +1028,10 @@ export function remeasureAfterFill(args: {
     fuelMap: args.basis.fuelMap,
     minRatioOverride: args.basis.floor,
     rules: args.rules,
+    rejected: args.basis.rejected,
   });
   if (Math.abs(choice.price - args.takeProfitPrice) < args.tickSize / 2) {
-    return { realRatio, lo, action: "no-better", choice, message: `target ${tp} is ${fmtX(realRatio)} against the real fill, below ${fmtX(lo)}; no other stored level beats it` };
+    return { realRatio, lo, action: "no-better", choice, message: `${tp} is ${fmtX(realRatio)} against the real fill, below ${fmtX(lo)}; no other stored level beats it` };
   }
-  return { realRatio, lo, action: "re-choose", choice, message: `target ${tp} is ${fmtX(realRatio)} against the real fill, below ${fmtX(lo)}; re-chosen: ${choice.reason}` };
+  return { realRatio, lo, action: "re-choose", choice, message: `${tp} is ${fmtX(realRatio)} against the real fill, below ${fmtX(lo)}; re-chosen: ${choice.reason}` };
 }
