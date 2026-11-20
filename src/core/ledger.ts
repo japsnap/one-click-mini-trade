@@ -58,6 +58,7 @@
  */
 import { splitFees, type FeeSplit } from "./fees";
 import { setStopPrice, type SetStop, type StopBound, type StopCap } from "./stop";
+import type { TargetBasis } from "./takeProfit";
 import type { Side } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -194,6 +195,29 @@ export interface SetRecord {
   /** Set when something needs a person: an exit lost on the exchange, a failed cancel. */
   needsAttention: string | null;
   legs: SetLeg[];
+  /**
+   * The target as planned (takeProfit.ts, v2 of 2026-11-20): its reason, and the stored
+   * candidates and brakes, so it can be measured and chosen again against the real fill
+   * (A7, server/execute.ts remeasureTargets). Missing on Sets saved before v2 and on Draw.
+   */
+  target?: SetTarget | null;
+}
+
+/** The target of a Set and what the real fill did to it. Plain JSON. */
+export interface SetTarget {
+  reason: string;
+  /** Ratio against the PLANNED entry and stop. */
+  planRatio: number;
+  basis: TargetBasis;
+  /** Ratio against the real fill and the re-set stop; null until the first fill. */
+  realRatio: number | null;
+  /** The fill and stop that realRatio was measured at (a re-measure runs once per new pair). */
+  measuredAtFill: number | null;
+  measuredAtStop?: number | null;
+  /** What the last re-measure did, in words (also in the log). */
+  lastCheck: string | null;
+  /** A better target found after the fill but not placed (updateStrategyOrder unproven live). */
+  pendingPrice: number | null;
 }
 
 /** A mismatch seen once and waiting for its second sight (decision 6). */
@@ -244,6 +268,8 @@ export function createSetRecord(args: {
   positionMode: PositionMode;
   legs: NewLeg[];
   now: number;
+  /** The plan's target (single-entry modes); omitted for Draw. */
+  target?: { reason: string; planRatio: number; basis: TargetBasis } | null;
 }): SetRecord {
   if (args.legs.length < 1 || args.legs.length > 9) throw new RangeError("a Set has 1 to 9 legs");
   const totalQty = args.legs.reduce((s, l) => s + l.qty, 0);
@@ -267,6 +293,7 @@ export function createSetRecord(args: {
     closedAt: null,
     closeReason: null,
     needsAttention: null,
+    target: args.target ? { ...structuredClone(args.target), realRatio: null, measuredAtFill: null, lastCheck: null, pendingPrice: null } : null,
     legs: args.legs.map((l, i) => {
       const index = i + 1;
       return {

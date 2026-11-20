@@ -22,9 +22,14 @@ type Check =
   | { kind: "number"; min: number; max: number; integer?: boolean; minExclusive?: boolean }
   | { kind: "numberList"; min: number; max: number; integer?: boolean }
   | { kind: "stringList"; pattern: RegExp }
-  | { kind: "oneOf"; values: readonly string[] };
+  | { kind: "oneOf"; values: readonly string[] }
+  /** An object of named numbers ({"shy": 24, ...}); an override may give only some of the names. */
+  | { kind: "numberMap"; keys: readonly string[]; min: number; max: number; integer?: boolean }
+  /** An old key, still accepted for one release so an override file keyed to it loads; its value is ignored. */
+  | { kind: "deprecated"; replacedBy: string };
 
 const fraction = (max = 1): Check => ({ kind: "number", min: 0, max, minExclusive: true });
+const MODES = ["shy", "deserved", "greedy"] as const;
 
 /** Every rule key with its allowed type and range. A key missing here is unknown. */
 const SCHEMA: Record<string, Check> = {
@@ -34,12 +39,32 @@ const SCHEMA: Record<string, Check> = {
   "target.deserved": { kind: "number", min: 1, max: 50 },
   "target.greedy": { kind: "number", min: 1, max: 50 },
   "target.default": { kind: "oneOf", values: ["shy", "deserved", "greedy"] },
-  "target.wallSearchReach": { kind: "number", min: 1, max: 10 },
+  "target.ratioSlack": { kind: "number", min: 0, max: 0.5 },
+  "target.windowTop": { kind: "number", min: 1, max: 10 },
+  "target.horizonHours": { kind: "numberMap", keys: MODES, min: 1, max: 720 },
+  "target.rewardPower": { kind: "numberMap", keys: MODES, min: 0, max: 3 },
+  "target.volLookbackHours": { kind: "number", min: 2, max: 1000, integer: true },
+  "target.volFloor": fraction(0.1),
+  "target.minReach": { kind: "number", min: 0, max: 0.5 },
+  "target.fuelBandWidth": fraction(0.05),
+  "target.fuelMaxBands": { kind: "number", min: 1, max: 50, integer: true },
+  "target.fuelMinUsd": { kind: "number", min: 0, max: 1e10 },
+  "target.fuelInset": { kind: "number", min: 0, max: 0.05 },
+  "target.fuelDensityBonus": { kind: "number", min: 0, max: 2 },
+  "target.fuelMapTopN": { kind: "number", min: 0, max: 2000, integer: true },
+  "target.fuelMapRefreshMinutes": { kind: "number", min: 1, max: 1440 },
+  "target.brakeWeight": { kind: "number", min: 0, max: 10 },
+  "target.brakePass": { kind: "number", min: 0, max: 1 },
+  "target.brakeShadow": { kind: "number", min: 0, max: 0.05 },
+  "target.sameSpotGap": { kind: "number", min: 0, max: 0.05 },
   "target.wallMinUsd": { kind: "number", min: 0, max: 1e9 },
   "target.wallBandWidth": fraction(0.05),
   "target.wallFrontGap": { kind: "number", min: 0, max: 0.05 },
   "target.wallJitter": { kind: "number", min: 0, max: 0.05 },
-  "target.roundNumberReach": { kind: "number", min: 0, max: 5 },
+  "target.swingLookback": { kind: "numberMap", keys: ["1h", "4h"], min: 0, max: 1000, integer: true },
+  // Old keys of the v1 target (wall search, round-number snap), retired 2026-11-20 by the v2 target.
+  "target.wallSearchReach": { kind: "deprecated", replacedBy: "target.windowTop" },
+  "target.roundNumberReach": { kind: "deprecated", replacedBy: "target.windowTop" },
   "entry.default": { kind: "oneOf", values: ["now", "nearby", "patient", "draw"] },
   "entry.nudge": { kind: "number", min: 0, max: 0.01 },
   "entry.nearbyMinDistance": { kind: "number", min: 0, max: 0.1 },
@@ -80,9 +105,35 @@ function checkLeaf(key: string, v: unknown, c: Check): void {
   } else if (c.kind === "stringList") {
     if (!Array.isArray(v) || v.length === 0) throw bad("must be a non-empty list of names");
     for (const x of v) if (typeof x !== "string" || !c.pattern.test(x)) throw bad("every entry must look like BTCUSDT");
+  } else if (c.kind === "numberMap") {
+    if (v === null || typeof v !== "object" || Array.isArray(v)) throw bad(`must be an object with ${c.keys.join(", ")}`);
+    for (const [name, x] of Object.entries(v as Record<string, unknown>)) {
+      if (name.startsWith("_")) continue;
+      if (!c.keys.includes(name)) throw new RulesError(`unknown rule "${key}.${name}" (known: ${c.keys.join(", ")})`);
+      if (typeof x !== "number" || !inRange(x, c)) {
+        throw new RulesError(`rule "${key}.${name}": must be a number from ${c.min} to ${c.max}${c.integer ? ", a whole number" : ""} (got ${JSON.stringify(x)})`);
+      }
+    }
+  } else if (c.kind === "deprecated") {
+    // Accepted and ignored; the server's loader names it so the owner can remove it.
+    if (typeof v !== "number") throw bad("must be a number (the key is no longer used)");
   } else if (!c.values.includes(v as string)) {
     throw bad(`must be one of ${c.values.join(", ")}`);
   }
+}
+
+/** Old keys present in an override (parsed JSON), as "group.key" names. Their values are ignored. */
+export function deprecatedKeysIn(override: unknown): string[] {
+  const out: string[] = [];
+  if (override === null || typeof override !== "object" || Array.isArray(override)) return out;
+  for (const [group, value] of Object.entries(override as Record<string, unknown>)) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) continue;
+    for (const k of Object.keys(value as Record<string, unknown>)) {
+      const c = SCHEMA[`${group}.${k}`];
+      if (c?.kind === "deprecated") out.push(`${group}.${k} (replaced by ${c.replacedBy})`);
+    }
+  }
+  return out;
 }
 
 /**
@@ -103,12 +154,20 @@ export function mergeRules(override: unknown, base: SetRules = DEFAULT_RULES): S
       const check = SCHEMA[key];
       if (!check) throw new RulesError(`unknown rule "${key}"`);
       checkLeaf(key, v, check);
-      (out[group] as Record<string, unknown>)[k] = Array.isArray(v) ? [...v] : v;
+      if (check.kind === "deprecated") continue; // accepted, not used
+      const g = out[group] as Record<string, unknown>;
+      if (check.kind === "numberMap") g[k] = { ...(g[k] as Record<string, number>), ...withoutNotes(v as Record<string, unknown>) };
+      else g[k] = Array.isArray(v) ? [...v] : v;
     }
   }
   const r = out as unknown as SetRules;
   checkConsistency(r);
   return r;
+}
+
+/** An object without its "_comment" style keys. */
+function withoutNotes(o: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(o).filter(([k]) => !k.startsWith("_")));
 }
 
 /** Rules that only make sense together. */

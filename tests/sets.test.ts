@@ -31,6 +31,7 @@ import {
   stopCapFor,
   symbolLeverageTarget,
   checkMarginForSet,
+  type LedgerLog,
   type OrderUpdate,
   type SetLedger,
 } from "../src/core/ledger";
@@ -39,7 +40,7 @@ import { checkCoinIsFree, checkNewSetRisk, parseAccountRisk } from "../src/core/
 import { buildSetPlan, withSymbolLeverage, type SetPlan } from "../src/core/plan";
 import { seededRandom, type SymbolRules } from "../src/core/types";
 import { AsterClient, parseOrderTradeUpdate, privateKeySigner } from "../src/exchange/aster";
-import { executeLive, handleOrderUpdate, memoryLedgerStore, reconcileSymbol } from "../server/execute";
+import { describeTarget, executeLive, handleOrderUpdate, memoryLedgerStore, reconcileSymbol, remeasureTargets } from "../server/execute";
 
 const BTC: SymbolRules = { symbol: "BTCUSDT", tickSize: 0.1, stepSize: 0.001, minQty: 0.001, marketStepSize: 0.001, marketMinQty: 0.001, minNotionalUsd: 5 };
 const NO_LEVELS = { limitLevels: [], takeProfitLevels: [], liquidationLevels: [] };
@@ -93,8 +94,8 @@ interface OtherCoin {
   markPrice: number;
 }
 
-function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?: number; available?: number; others?: OtherCoin[] }) {
-  const state = { ...init, wallet: init.wallet ?? 1000, available: init.available ?? 1000, others: init.others ?? [] };
+function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?: number; available?: number; others?: OtherCoin[]; symbol?: string; failTakeProfitUpdate?: boolean }) {
+  const state = { ...init, wallet: init.wallet ?? 1000, available: init.available ?? 1000, others: init.others ?? [], symbol: init.symbol ?? "BTCUSDT" };
   const calls: Array<{ method: string; path: string; params: URLSearchParams }> = [];
   let nextStrategy = 100;
   const json = (x: unknown, status = 200) => new Response(JSON.stringify(x), { status });
@@ -109,7 +110,7 @@ function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?
       case "GET /fapi/v3/positionRisk":
         return json(
           state.rows.map((r) => ({
-            symbol: "BTCUSDT",
+            symbol: state.symbol,
             positionSide: r.positionSide,
             positionAmt: String(r.positionAmt),
             entryPrice: String(r.entryPrice ?? 0),
@@ -129,7 +130,7 @@ function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?
           ),
           positions: [
             ...state.rows.map((r) => ({
-              symbol: "BTCUSDT",
+              symbol: state.symbol,
               positionSide: r.positionSide,
               positionAmt: String(r.positionAmt),
               entryPrice: String(r.entryPrice ?? 0),
@@ -155,8 +156,14 @@ function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?
         return json({ leverage: state.leverage, symbol: "BTCUSDT" });
       case "POST /fapi/v3/placeStrategyOrder":
         return json({ strategyId: nextStrategy++, clientStrategyId: params.get("clientStrategyId"), strategyType: "OTOCO", strategyStatus: "WORKING", failureCode: 0 });
-      case "POST /fapi/v3/updateStrategyOrder":
+      case "POST /fapi/v3/updateStrategyOrder": {
+        // failTakeProfitUpdate: refuse a change of the take-profit's price (sub-order 2 with a stopPrice).
+        const subs = JSON.parse(params.get("subOrderList") ?? "[]") as Array<Record<string, string>>;
+        if (state.failTakeProfitUpdate && subs.some((x) => x.strategySubId === "2" && x.stopPrice !== undefined)) {
+          return json([{ strategyId: Number(params.get("strategyId")), updateStatus: "FAILED", failureCode: -4000, failureReason: "fake refusal" }]);
+        }
         return json([{ strategyId: Number(params.get("strategyId")), updateStatus: "SUCCESS", failureCode: 0 }]);
+      }
       case "DELETE /fapi/v3/order":
         return json({ status: "CANCELED", clientOrderId: params.get("origClientOrderId") });
       default:
@@ -646,5 +653,128 @@ describe("Order events from Aster's user data stream (REAL)", () => {
     const r = reconcile(ledger, { symbol: "BTCUSDT", mode: "one-way", positions: [{ positionSide: "BOTH", positionAmt: 0 }], stepSize: 0.001, now: 5, graceMs: 0 });
     expect(r.actions.every((a) => a.kind === "cancel")).toBe(true);
     expect(r.ledger.sets[0]!.status).toBe("closed-outside");
+  });
+});
+
+/**
+ * The target against the real fill (Sets_Rules.md A7, build step E3). HYBRID: the real
+ * executor, ledger, stop re-set and target re-measure, the real AsterClient with real
+ * signatures, against the stateful FAKE Aster above (symbol ETHUSDT). The fake's
+ * positionRisk carries the liquidation price 1,749.83 of 2026-11-19, so the stop the resync
+ * computes is 85% of the real liquidation distance from the fill. Every check reads the
+ * ledger copy before and after, and the exact updateStrategyOrder bodies sent.
+ */
+describe("Target against the real fill (A7, HYBRID)", () => {
+  const ETH: SymbolRules = { symbol: "ETHUSDT", tickSize: 0.01, stepSize: 0.001, minQty: 0.001, marketStepSize: 0.001, marketMinQty: 0.001, minNotionalUsd: 5 };
+  const ethPlan = () =>
+    buildSetPlan({ input: { symbol: "ETHUSDT", side: "buy", ticketUsd: 10, leverage: 30, tpMode: "deserved", entryMode: "now" }, currentPrice: 1805.73, rules: ETH, levels: NO_LEVELS, random: () => 0.5, market: { sigma1h: 0.007 } });
+  const evEth = (id: string, status: string, qty: number, price: number): OrderUpdate => ({ ...ev(id, status, qty, price), symbol: "ETHUSDT" });
+  const tpBodies = (fake: ReturnType<typeof fakeAster>) =>
+    fake.of("POST", "/fapi/v3/updateStrategyOrder").flatMap((c) => (JSON.parse(c.params.get("subOrderList")!) as Array<Record<string, string>>).filter((x) => x.strategySubId === "2" && x.stopPrice !== undefined));
+
+  async function placedSet(id: string, opts: { failTakeProfitUpdate?: boolean } = {}) {
+    const plan = ethPlan();
+    const fake = fakeAster({ dual: false, leverage: 30, rows: [{ positionSide: "BOTH", positionAmt: 0 }], symbol: "ETHUSDT", ...opts });
+    const store = memoryLedgerStore();
+    const r = await executeLive(fake.client, plan, ETH, { store, setId: id, reduceOnlyExits: true });
+    expect(r.ok).toBe(true);
+    return { plan, fake, store };
+  }
+
+  it("the ledger keeps the plan's reason and stored candidates", async () => {
+    const { plan, store } = await placedSet("set_fill0");
+    expect(plan.takeProfit.price).toBe(1899.43);
+    const t = store.current().sets[0]!.target!;
+    expect(t.reason).toBe(plan.takeProfit.reason);
+    expect(t.planRatio).toBe(plan.takeProfit.ratio);
+    expect(t.basis.candidates.map((c) => c.price)).toEqual([1899.43, 1949.41]);
+    expect(t).toMatchObject({ realRatio: null, measuredAtFill: null, pendingPrice: null });
+  });
+
+  it("filled 23 cents above the plan: about 1.96x against the real fill, at or above 1.9x, nothing moves", async () => {
+    const { fake, store } = await placedSet("set_fill1");
+    const before = structuredClone(store.current().sets[0]!);
+    fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0.166, entryPrice: 1805.96, liquidationPrice: 1749.83 }];
+    const out = await handleOrderUpdate(fake.client, evEth("set_fill1-1E", "FILLED", 0.166, 1805.96), ETH, { store });
+    const after = store.current().sets[0]!;
+    const leg = after.legs[0]!;
+    // The stop was re-set from the fill: 1,805.96 - 0.85 x 56.13 = 1,758.25.
+    expect(leg.stop.stopPrice).toBe(1758.25);
+    expect(leg.takeProfit.stopPrice).toBe(before.legs[0]!.takeProfit.stopPrice); // 1,899.43, unchanged
+    expect(after.target!.realRatio).toBeCloseTo((1899.43 - 1805.96) / (1805.96 - 1758.25), 6);
+    expect(after.target!.realRatio).toBeGreaterThanOrEqual(1.9);
+    expect(after.target!.lastCheck).toMatch(/1\.96x against the real fill, at or above 1\.9x: kept/);
+    expect(tpBodies(fake)).toHaveLength(0); // the take-profit price was never sent again
+    expect(out.log.some((l) => l.message.includes("[counts] remeasureTargets ETHUSDT: measured 1, re-placed 0"))).toBe(true);
+    // A repeated event does not measure twice.
+    const again = await handleOrderUpdate(fake.client, evEth("set_fill1-1E", "FILLED", 0, 0), ETH, { store });
+    expect(again.log.some((l) => l.message.includes("measured 1"))).toBe(false);
+  });
+
+  it("filled 3 dollars above the plan: 1.81x, re-chosen 1,949.41; kept and logged until updateStrategyOrder is proven", async () => {
+    const { fake, store } = await placedSet("set_fill2");
+    fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0.166, entryPrice: 1808.73, liquidationPrice: 1749.83 }];
+    const out = await handleOrderUpdate(fake.client, evEth("set_fill2-1E", "FILLED", 0.166, 1808.73), ETH, { store });
+    const after = store.current().sets[0]!;
+    expect(after.legs[0]!.stop.stopPrice).toBe(1758.67);
+    expect(after.legs[0]!.takeProfit.stopPrice).toBe(1899.43); // kept
+    expect(after.target!.realRatio).toBeCloseTo((1899.43 - 1808.73) / (1808.73 - 1758.67), 6); // 1.812
+    expect(after.target!.pendingPrice).toBe(1949.41);
+    expect(after.target!.lastCheck).toBe(
+      "kept, update unproven: target 1,899.43 is 1.81x against the real fill, below 1.9x; re-chosen: no liquidation cluster between 1.9x and 4x, so target 1,949.41, just in front of 1,950 (a round number), 2.81x the stop",
+    );
+    expect(out.log.some((l) => l.level === "warn" && l.message.includes("kept, update unproven") && l.message.includes("would re-place at 1949.41"))).toBe(true);
+    expect(tpBodies(fake)).toHaveLength(0);
+    expect(describeTarget(after)).toMatchObject({ realRatioText: "1.81x against the real fill", pendingPrice: 1949.41 });
+  });
+
+  it("with re-placing switched on and the client reporting success: the take-profit moves to 1,949.41, logged re-placed", async () => {
+    const { fake, store } = await placedSet("set_fill3");
+    fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0.166, entryPrice: 1808.73, liquidationPrice: 1749.83 }];
+    const out = await handleOrderUpdate(fake.client, evEth("set_fill3-1E", "FILLED", 0.166, 1808.73), ETH, { store, replaceTakeProfitAfterFill: true });
+    const sent = tpBodies(fake);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ strategySubId: "2", type: "TAKE_PROFIT_MARKET", side: "SELL", symbol: "ETHUSDT", stopPrice: "1949.41", quantity: "0.166", workingType: "MARK_PRICE" });
+    const after = store.current().sets[0]!;
+    expect(after.legs[0]!.takeProfit.stopPrice).toBe(1949.41);
+    expect(after.legs[0]!.entry.fills[0]!.price).toBe(1808.73); // the entry is never touched
+    expect(after.legs[0]!.stop.stopPrice).toBe(1758.67); // nor the stop
+    expect(after.target!.realRatio).toBeCloseTo((1949.41 - 1808.73) / (1808.73 - 1758.67), 6);
+    expect(after.target!.pendingPrice).toBeNull();
+    expect(out.log.some((l) => l.message.startsWith("re-placed take-profit at 1949.41"))).toBe(true);
+  });
+
+  it("a log-only pass (reconcile) stamps the fill first; a later re-place-on pass still re-places the pending level, exactly once", async () => {
+    const { fake, store } = await placedSet("set_fill5");
+    fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0.166, entryPrice: 1808.73, liquidationPrice: 1749.83 }];
+    await handleOrderUpdate(fake.client, evEth("set_fill5-1E", "FILLED", 0.166, 1808.73), ETH, { store }); // re-place off: pending
+    await reconcileSymbol(fake.client, ETH, { store, now: () => 10_000 }); // log-only remeasure on the same (fill, stop)
+    const stamped = store.current();
+    expect(stamped.sets[0]!.target).toMatchObject({ pendingPrice: 1949.41, measuredAtFill: 1808.73, measuredAtStop: 1758.67 });
+    expect(tpBodies(fake)).toHaveLength(0);
+    const log: LedgerLog[] = [];
+    const after = await remeasureTargets(fake.client, stamped, ETH, log, { replaceTakeProfit: true });
+    expect(tpBodies(fake).map((x) => x.stopPrice)).toEqual(["1949.41"]);
+    expect(after.sets[0]!.legs[0]!.takeProfit.stopPrice).toBe(1949.41);
+    expect(after.sets[0]!.target!.pendingPrice).toBeNull();
+    expect(log.some((l) => l.message.startsWith("re-placed take-profit at 1949.41"))).toBe(true);
+    // Nothing pending any more: the same pair is skipped, no second order change.
+    await remeasureTargets(fake.client, after, ETH, [], { replaceTakeProfit: true });
+    expect(tpBodies(fake)).toHaveLength(1);
+    // Re-place off: a stamped pair with a pending level is still skipped (no repeated log line).
+    const offLog: LedgerLog[] = [];
+    await remeasureTargets(fake.client, stamped, ETH, offLog);
+    expect(offLog.some((l) => l.message.includes("kept, update unproven"))).toBe(false);
+  });
+
+  it("re-placing switched on but the client refusing: the target stays, the Set is flagged, the failure is loud (negative)", async () => {
+    const { fake, store } = await placedSet("set_fill4", { failTakeProfitUpdate: true });
+    fake.state.rows = [{ positionSide: "BOTH", positionAmt: 0.166, entryPrice: 1808.73, liquidationPrice: 1749.83 }];
+    const out = await handleOrderUpdate(fake.client, evEth("set_fill4-1E", "FILLED", 0.166, 1808.73), ETH, { store, replaceTakeProfitAfterFill: true });
+    const after = store.current().sets[0]!;
+    expect(after.legs[0]!.takeProfit.stopPrice).toBe(1899.43);
+    expect(after.needsAttention).toMatch(/take-profit re-place failed/);
+    expect(after.target!.pendingPrice).toBe(1949.41);
+    expect(out.log.some((l) => l.level === "error" && l.message.startsWith("TAKE-PROFIT RE-PLACE FAILED, kept at 1899.43"))).toBe(true);
   });
 });

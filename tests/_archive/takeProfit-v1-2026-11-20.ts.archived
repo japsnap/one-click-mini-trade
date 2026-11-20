@@ -1,0 +1,115 @@
+/*
+ * ARCHIVED 2026-11-20 (not run: the file name does not end in .test.ts).
+ * Reason retired: the v1 take-profit (heaviest wall between the floor and 1.5 times it, else
+ * the nearest round number or trader take-profit beyond the floor within +35%, else the bare
+ * floor) was replaced by the v2 target of Sets_Rules.md section A (liquidation clusters and
+ * brakes scored by pull, reach, pass and reward, 0.1x slack, never just behind a brake).
+ * findVolumeZone, the "volume-zone" source, `zone`, `diagnostics`, `tolerance` and the
+ * roundNumberReach / wallSearchReach knobs no longer exist; these tests asserted exactly that
+ * v1 behaviour (for example 67,000 as the first round number BEYOND 2x, which v2 deliberately
+ * replaces by the level in front of a round number).
+ * What covers the subject now: tests/core.test.ts, describe "target v2 (Sets_Rules.md E1)",
+ * tests (a) to (l), plus "take-profit" (ratio below 1, exact price, round-number steps,
+ * Greedy short).
+ * The blocks below are the original, word for word (they sat inside describe("take-profit")
+ * and describe("take-profit volume zone") of tests/core.test.ts, and used its BTC, DEPTH and
+ * seededRandom helpers).
+ */
+  it("no volume zone: Deserved on a BTC long snaps to the round number just beyond 2x the stop distance", () => {
+    // Stop 62,720 (distance 1,280); 2x target 66,560; window to 66,560 + 0.35 x 2,560 = 67,456.
+    const tp = pickTakeProfit({ entry: 64000, side: "buy", stopPrice: 62720, mode: "deserved", tickSize: 0.1 });
+    expect(tp.exactPrice).toBeCloseTo(66560);
+    expect(tp.price).toBe(66500 + 500); // 66,500 is below the 2x minimum, so 67,000
+    expect(tp.source).toBe("round-number");
+    expect(tp.ratio).toBeGreaterThanOrEqual(2);
+    expect(tp.zone).toBeNull();
+  });
+  it("a trader TP nearer the exact target beats a round number", () => {
+    const tp = pickTakeProfit({
+      entry: 64000,
+      side: "buy",
+      stopPrice: 62720,
+      mode: "deserved",
+      tickSize: 0.1,
+      traderTakeProfits: [{ price: 66600, weightUsd: 1 }, { price: 66000, weightUsd: 1e9 }], // 66,000 is below 2x: ignored
+    });
+    expect(tp.price).toBe(66600);
+    expect(tp.source).toBe("trader-tp");
+  });
+  it("falls back to the exact ratio when no key level fits, rounding away from entry", () => {
+    // Sell at 64,010 with the stop 640.1 above: Shy 1x target 63,369.9; window down to 63,145.865: no round number (63,000 is outside).
+    const tp = pickTakeProfit({ entry: 64010, side: "sell", stopPrice: 64650.1, mode: "shy", tickSize: 0.1 });
+    expect(tp.source).toBe("exact-ratio");
+    expect(tp.price).toBeLessThanOrEqual(tp.exactPrice);
+    expect(tp.ratio).toBeGreaterThanOrEqual(1);
+    expect(isOnStep(tp.price, 0.1)).toBe(true);
+  });
+  it("Greedy keeps >= 4x for shorts too", () => {
+    const tp = pickTakeProfit({ entry: 3000, side: "sell", stopPrice: 3085, mode: "greedy", tickSize: 0.01 });
+    expect(tp.ratio).toBeGreaterThanOrEqual(4);
+    expect(tp.price).toBeLessThan(3000);
+  });
+});
+
+describe("take-profit volume zone", () => {
+  // Buy at 64,000, stop 62,720 (1,280 away). Deserved minimum 66,560; zone window up to 1.5x = 67,840.
+  const base = { entry: 64000, side: "buy" as const, stopPrice: 62720, mode: "deserved" as const, tickSize: 0.1 };
+  const asks = [
+    { price: 66400, weightUsd: 9e6 }, // below the minimum: never a target
+    { price: 66700, weightUsd: 40_000 }, // 2,700 above entry: bucket floor(2700 / 32) = 84
+    { price: 67210, weightUsd: 300_000 }, // k = floor(3210/32) = 100: the heaviest
+    { price: 67220, weightUsd: 200_000 }, // same bucket (3220/32 = 100.6)
+    { price: 67900, weightUsd: 9e6 }, // beyond 1.5x (67,840): ignored
+  ];
+  it("stops just in front of the heaviest wall beyond the minimum, within the jitter band", () => {
+    const tp = pickTakeProfit({ ...base, oppositeVolume: asks, random: () => 0.5 });
+    expect(tp.source).toBe("volume-zone");
+    expect(tp.zone?.weightUsd).toBe(500_000);
+    expect(tp.zone?.frontPrice).toBe(67210); // the wall starts at its nearest order
+    // r = 0.5 -> exactly 0.03% in front: 67,210 x (1 - 0.0003) = 67,189.837 -> toward entry 67,189.8
+    expect(tp.price).toBe(67189.8);
+    expect(tp.ratio).toBeGreaterThanOrEqual(2);
+    expect(tp.diagnostics).toEqual({ levelsRead: 5, levelsInWindow: 3, bucketsInWindow: 2, heaviestBucketUsd: 500_000 });
+  });
+  it("jitter stays between 0% and 0.06% in front of the wall and never inside it (500 seeded draws)", () => {
+    const rnd = seededRandom(7);
+    for (let i = 0; i < 500; i++) {
+      const tp = pickTakeProfit({ ...base, oppositeVolume: asks, random: rnd });
+      expect(tp.price).toBeLessThanOrEqual(67210);
+      expect(tp.price).toBeGreaterThanOrEqual(67210 * (1 - 0.0006) - 0.1);
+      expect(isOnStep(tp.price, 0.1)).toBe(true);
+    }
+  });
+  it("never goes below the ratio minimum even when the wall sits right on it", () => {
+    // Wall front exactly at the 2x minimum 66,560: 0.03% in front would be below 2x, so it clamps to the minimum.
+    const tp = pickTakeProfit({ ...base, oppositeVolume: [{ price: 66560, weightUsd: 1e6 }], random: () => 0.99 });
+    expect(tp.source).toBe("volume-zone");
+    expect(tp.price).toBe(66560);
+    expect(tp.ratio).toBe(2);
+  });
+  it("a wall lighter than $25k does not count; falls back to the round number (negative)", () => {
+    const tp = pickTakeProfit({ ...base, oppositeVolume: [{ price: 67210, weightUsd: 24_999 }] });
+    expect(tp.source).toBe("round-number");
+    expect(tp.diagnostics.heaviestBucketUsd).toBe(24_999);
+  });
+  it("Sell mirrors: bids below, front is the HIGHEST bid of the wall, target above it", () => {
+    // Sell at 64,000, stop 65,280: minimum 61,440, window down to 60,160.
+    const z = findVolumeZone({ entry: 64000, side: "sell", levels: [{ price: 61000, weightUsd: 1e5 }, { price: 60990, weightUsd: 1e5 }, { price: 66000, weightUsd: 1e9 }], minDistance: 2560, maxDistance: 3840, bucketWidth: 0.0005, minWeightUsd: 25_000 });
+    expect(z.zone?.frontPrice).toBe(61000);
+    expect(z.diagnostics.levelsInWindow).toBe(2); // the 66,000 bid is on the loss side: ignored
+    const tp = pickTakeProfit({ entry: 64000, side: "sell", stopPrice: 65280, mode: "deserved", tickSize: 0.1, oppositeVolume: [{ price: 61000, weightUsd: 1e5 }] });
+    expect(tp.price).toBeGreaterThan(61000);
+    expect(tp.price).toBeLessThanOrEqual(61440);
+  });
+  it("on the real Aster book: a 30x Deserved Buy finds a wall and keeps >= 2x", () => {
+    const mid = 64426.1;
+    const s = planStop({ entry: mid, side: "buy", leverage: 30, tickSize: 0.1, maintenanceMarginRate: 0.005, maintenanceSource: "assumed" });
+    const tp = pickTakeProfit({ entry: mid, side: "buy", stopPrice: s.stopPrice, mode: "deserved", tickSize: 0.1, oppositeVolume: DEPTH.asks, random: seededRandom(1) });
+    expect(DEPTH.asks.length).toBe(1000);
+    expect(tp.ratio).toBeGreaterThanOrEqual(2);
+    expect(tp.diagnostics.levelsRead).toBe(1000);
+    // The book reaches about 5.4% up; the window starts at about 4.8%, so some asks are inside it.
+    expect(tp.diagnostics.levelsInWindow).toBeGreaterThan(0);
+  });
+});
+

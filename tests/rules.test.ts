@@ -150,3 +150,72 @@ describe("Rule set: the file loader (server/rules.ts)", () => {
     expect(loaded.rules.target.deserved).toBe(2.5);
   });
 });
+
+describe("Rule set: the target v2 knobs (Sets_Rules.md A, 2026-11-20)", () => {
+  it("hold the spec's defaults", () => {
+    const t = DEFAULT_RULES.target;
+    expect([t.ratioSlack, t.windowTop, t.volLookbackHours, t.volFloor, t.minReach]).toEqual([0.1, 2, 72, 0.002, 0.03]);
+    expect(t.horizonHours).toEqual({ shy: 24, deserved: 48, greedy: 96 });
+    expect(t.rewardPower).toEqual({ shy: 0.5, deserved: 1, greedy: 1.5 });
+    expect([t.fuelBandWidth, t.fuelMaxBands, t.fuelMinUsd, t.fuelInset, t.fuelDensityBonus, t.fuelMapTopN, t.fuelMapRefreshMinutes]).toEqual([0.001, 5, 100_000, 0.0005, 0.1, 600, 5]);
+    expect([t.brakeWeight, t.brakePass, t.brakeShadow, t.sameSpotGap]).toEqual([0.5, 0.8, 0.003, 0.001]);
+    expect([t.wallMinUsd, t.wallBandWidth, t.wallFrontGap, t.wallJitter]).toEqual([25_000, 0.0005, 0.0003, 0.0003]);
+    expect(t.swingLookback).toEqual({ "1h": 48, "4h": 42 });
+  });
+
+  it("every new bound refuses a value just outside it, naming the key (negative)", () => {
+    const cases: Array<[string, unknown]> = [
+      ["ratioSlack", -0.01], ["ratioSlack", 0.51],
+      ["windowTop", 0.99], ["windowTop", 10.1],
+      ["volLookbackHours", 1], ["volLookbackHours", 1001], ["volLookbackHours", 72.5],
+      ["volFloor", 0], ["volFloor", 0.11],
+      ["minReach", -0.01], ["minReach", 0.51],
+      ["fuelBandWidth", 0], ["fuelBandWidth", 0.06],
+      ["fuelMaxBands", 0], ["fuelMaxBands", 51], ["fuelMaxBands", 2.5],
+      ["fuelMinUsd", -1], ["fuelMinUsd", 1e11],
+      ["fuelInset", -0.001], ["fuelInset", 0.06],
+      ["fuelDensityBonus", -0.1], ["fuelDensityBonus", 2.1],
+      ["fuelMapTopN", -1], ["fuelMapTopN", 2001], ["fuelMapTopN", 600.5],
+      ["fuelMapRefreshMinutes", 0.5], ["fuelMapRefreshMinutes", 1441],
+      ["brakeWeight", -0.1], ["brakeWeight", 10.1],
+      ["brakePass", -0.1], ["brakePass", 1.1],
+      ["brakeShadow", -0.001], ["brakeShadow", 0.06],
+      ["sameSpotGap", -0.001], ["sameSpotGap", 0.06],
+    ];
+    for (const [k, v] of cases) expect(() => mergeRules({ target: { [k]: v } }), `${k} = ${v}`).toThrow(new RegExp(`"target\\.${k}"`));
+    const maps: Array<[string, string, unknown]> = [
+      ["horizonHours", "deserved", 0.5], ["horizonHours", "greedy", 721],
+      ["rewardPower", "greedy", -0.1], ["rewardPower", "shy", 3.1],
+      ["swingLookback", "1h", -1], ["swingLookback", "4h", 1001], ["swingLookback", "4h", 1.5],
+    ];
+    for (const [k, n, v] of maps) expect(() => mergeRules({ target: { [k]: { [n]: v } } }), `${k}.${n} = ${v}`).toThrow(new RegExp(`"target\\.${k}\\.${n}"`));
+    expect(() => mergeRules({ target: { horizonHours: { brave: 10 } } })).toThrow(/unknown rule "target.horizonHours.brave"/);
+    expect(() => mergeRules({ target: { horizonHours: 48 } })).toThrow(/"target.horizonHours": must be an object/);
+    // The edges themselves are allowed.
+    expect(() => mergeRules({ target: { ratioSlack: 0.5, windowTop: 10, minReach: 0.5, fuelMapTopN: 2000, horizonHours: { shy: 1, greedy: 720 }, rewardPower: { shy: 0, greedy: 3 } } })).not.toThrow();
+  });
+
+  it("a per-mode override keeps the other modes; the knobs change the pick", () => {
+    expect(mergeRules({ target: { horizonHours: { deserved: 72, _comment: "note" } } }).target.horizonHours).toEqual({ shy: 24, deserved: 72, greedy: 96 });
+    const at = () => buildSetPlan({ input: { symbol: "BTCUSDT", side: "buy", ticketUsd: 10, leverage: 30, tpMode: "deserved", entryMode: "now" }, currentPrice: 64000, rules: BTC, levels: NO_LEVELS, random: () => 0.5, market: { sigma1h: 0.007 } });
+    expect(at().takeProfit.source).toBe("round-number"); // 67,000 is reachable at 0.7% an hour
+    setActiveRules(mergeRules({ target: { minReach: 0.5 } }));
+    const strict = at();
+    expect(strict.takeProfit.source).toBe("exact-ratio"); // nothing has a 50% chance
+    expect(strict.takeProfit.reason).toMatch(/^the bare 2x/);
+  });
+
+  it("the old keys wallSearchReach and roundNumberReach still load and are ignored (deprecation window); the loader names them", () => {
+    const r = mergeRules({ target: { wallSearchReach: 1.5, roundNumberReach: 0.35, greedy: 5 } });
+    expect(r.target.greedy).toBe(5);
+    expect("wallSearchReach" in r.target).toBe(false);
+    expect("roundNumberReach" in r.target).toBe(false);
+    expect(() => mergeRules({ target: { roundNumberReach: "0.35" } })).toThrow(/"target.roundNumberReach": must be a number/);
+    const dir = mkdtempSync(path.join(tmpdir(), "set-rules-old-"));
+    const file = path.join(dir, "old.json");
+    writeFileSync(file, JSON.stringify({ target: { wallSearchReach: 2, roundNumberReach: 0.5, deserved: 2.5 } }));
+    const loaded = loadRulesFile({ SETS_RULES_FILE: file }, dir);
+    expect(activeRules().target.deserved).toBe(2.5);
+    expect(loaded.ignored).toEqual(["target.wallSearchReach (replaced by target.windowTop)", "target.roundNumberReach (replaced by target.windowTop)"]);
+  });
+});

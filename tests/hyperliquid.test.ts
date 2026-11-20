@@ -184,7 +184,7 @@ describe("HyperliquidLevelSource", () => {
     });
     await src.getTopTraders();
     expect(stats().lbCalls).toBe(1); // downloaded again instead of trusting the old file
-    expect(JSON.parse(written).key).toMatch(/^v2:/);
+    expect(JSON.parse(written).key).toMatch(/^v3:/); // v3 since 2026-11-20: the key also names the liquidation map's sample
   });
 
   it("all trader requests failing is a loud error, not empty levels (negative)", async () => {
@@ -207,5 +207,111 @@ describe("HyperliquidLevelSource", () => {
     expect(max).toBeLessThanOrEqual(3);
     expect(r[3]).toBeInstanceOf(Error);
     expect(r[6]).toBe(14);
+  });
+});
+
+/**
+ * The liquidation map (fuel map, Sets_Rules.md A1 and E2). HYBRID: a FAKE fetch serves a
+ * SYNTHETIC leaderboard of 700 accounts (made up here, not captured: the real fixture has
+ * only 3 rows) and the real captured clearinghouseState for every account; a fake clock is
+ * advanced by the injected sleep, so a 5-minute pass runs instantly. It proves the pacing,
+ * the budget accounting and the counts, not Hyperliquid's real answers (the live smoke does).
+ */
+describe("liquidation map (fuel map)", () => {
+  const row = (i: number) => ({
+    ethAddress: "0x" + (i + 1).toString(16).padStart(40, "0"),
+    accountValue: i % 50 === 49 ? "5000" : "50000", // every 50th account is under the $10k floor
+    windowPerformances: [["month", { pnl: i % 3 === 0 ? "-1200.5" : "900", roi: "0.01", vlm: String(1e9 - i * 1000) }]],
+  });
+  const SYNTH_LB = { leaderboardRows: Array.from({ length: 700 }, (_, i) => row(i)) };
+
+  function fuelFake(opts: { budget?: number; answerFirst?: number } = {}) {
+    let now = 0;
+    const calls: number[] = []; // fake-clock time of every clearinghouseState request
+    const f = async (url: string, init?: RequestInit) => {
+      if (url.includes("leaderboard")) return new Response(JSON.stringify(SYNTH_LB));
+      const body = JSON.parse(String(init?.body));
+      if (body.type === "clearinghouseState") {
+        calls.push(now);
+        if (opts.answerFirst !== undefined && calls.length > opts.answerFirst) return new Response("busy", { status: 503 });
+      }
+      return new Response(JSON.stringify(body.type === "clearinghouseState" ? CS : OO));
+    };
+    const lines: string[] = [];
+    const src = new HyperliquidLevelSource({
+      fetch: f,
+      now: () => now,
+      sleep: async (ms) => void (now += ms),
+      log: (l) => lines.push(l),
+      fuelMap: { topN: 600, refreshMinutes: 5 },
+      ...(opts.budget ? { weightBudgetPerMinute: opts.budget } : {}),
+    });
+    return { src, calls, lines, clock: () => now, advance: (ms: number) => void (now += ms) };
+  }
+
+  it("samples the top 600 by 30-day volume with at least $10k, losers included (skill does not matter for fuel)", async () => {
+    const { src } = fuelFake();
+    const t = await src.getFuelTraders();
+    expect(t).toHaveLength(600);
+    expect(t.every((x) => x.accountValueUsd >= 10_000)).toBe(true);
+    expect(t.some((x) => x.monthPnlUsd < 0)).toBe(true);
+    for (let i = 1; i < t.length; i++) expect(t[i - 1]!.monthVolumeUsd).toBeGreaterThanOrEqual(t[i]!.monthVolumeUsd);
+  });
+
+  it("one pass is spread over the 5 minutes: 600 requests, 1,200 weight, never more than 1,200 in any 5 minutes", async () => {
+    const { src, calls, lines, clock } = fuelFake();
+    const before = src.getFuelLevels("BTC");
+    expect(before.status).toBe("unavailable"); // nothing read yet: said, not an empty list passed off as "no clusters"
+    expect(before.note).toMatch(/not read yet/);
+    const r = await src.refreshFuelMap();
+    expect(r).toMatchObject({ addressesInSample: 600, addressesAsked: 600, answered: 600, failed: 0, skippedByBudget: 0, weightSpent: 1200 });
+    expect(calls).toHaveLength(600);
+    expect(clock()).toBeGreaterThanOrEqual(299_000); // the pass took the whole window, not a burst
+    for (const t0 of calls) expect(calls.filter((t) => t >= t0 && t < t0 + 300_000).length * 2).toBeLessThanOrEqual(1200);
+    for (const t0 of calls) expect(calls.filter((t) => t >= t0 && t < t0 + 60_000).length * 2).toBeLessThanOrEqual(1100); // under the per-minute budget
+    expect(lines.some((l) => /liquidation map pass 1: sample 600, asked 600, answered 600, failed 0, skipped by budget 0, weight 1200/.test(l))).toBe(true);
+    const btc = src.getFuelLevels("BTC", 64000);
+    expect(btc.status).toBe("ok");
+    expect(btc.levels.length).toBe(600 * parseClearinghouseState(CS, "BTC").length);
+    expect(btc.report).toMatchObject({ coin: "BTC", addressesWithFreshAnswer: 600, liquidationLevels: btc.levels.length });
+    expect(btc.report.shortLevelsAbove! + btc.report.longLevelsBelow!).toBeLessThanOrEqual(btc.levels.length);
+    expect(src.getFuelLevels("ETH").levels.length).toBe(600 * parseClearinghouseState(CS, "ETH").length); // one answer serves every coin
+  });
+
+  it("a budget skip is counted, not silent; answers older than 3 windows stop counting (negative)", async () => {
+    const { src, lines, advance } = fuelFake({ budget: 20 }); // 20 weight per minute: 10 requests a minute fit
+    const r = await src.refreshFuelMap();
+    expect(r.skippedByBudget).toBeGreaterThan(0);
+    expect(r.answered + r.failed + r.skippedByBudget).toBe(r.addressesAsked);
+    expect(r.answered).toBeLessThanOrEqual(10 * 6); // about 5 minutes at 10 a minute
+    expect(lines.some((l) => new RegExp(`skipped by budget ${r.skippedByBudget}`).test(l))).toBe(true);
+    // Under half the sample answered: too thin to trust (Sets_Rules review 2026-11-20).
+    const thin = src.getFuelLevels("BTC");
+    expect(thin.status).toBe("unavailable");
+    expect(thin.note).toBe(`thin: ${r.answered} of 600 accounts`);
+    advance(16 * 60_000); // past 3 refresh windows with no new pass
+    const stale = src.getFuelLevels("BTC");
+    expect(stale.status).toBe("unavailable");
+    expect(stale.levels).toHaveLength(0);
+    expect(stale.note).toMatch(/no fresh answer/);
+  });
+
+  it("12 of 600 accounts answering is thin: unavailable, with the count in the note (negative)", async () => {
+    const { src } = fuelFake({ answerFirst: 12 });
+    const r = await src.refreshFuelMap();
+    expect(r).toMatchObject({ addressesAsked: 600, answered: 12, failed: 588 });
+    const f = src.getFuelLevels("ETH", 1805.73);
+    expect(f.status).toBe("unavailable");
+    expect(f.note).toBe("thin: 12 of 600 accounts");
+    expect(f.report.addressesWithFreshAnswer).toBe(12);
+    expect(f.levels).toHaveLength(12); // still counted for the log, never used as clusters
+  });
+
+  it("is off when topN is 0, and says so", () => {
+    const src = new HyperliquidLevelSource({ log: () => undefined, fuelMap: { topN: 0, refreshMinutes: 5 } });
+    const f = src.getFuelLevels("BTC");
+    expect(f.status).toBe("unavailable");
+    expect(f.note).toMatch(/off/);
+    expect(f.report.enabled).toBe(false);
   });
 });

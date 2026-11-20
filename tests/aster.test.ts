@@ -8,7 +8,7 @@
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import {
+import { parseKlines,
   AsterApiError,
   AsterClient,
   asterTypedData,
@@ -237,5 +237,24 @@ describe("OTOCO strategy request (HYBRID: fake fetch, real signature)", () => {
     expect(params.get("builder")).toBe("0xecD0674915473B0F2D9061dc6a004f18E29a882E");
     expect(params.get("feeRate")).toBe("0.0001");
     expect(await recoverAsterSigner(msg!, sig as `0x${string}`)).toBe(DEMO_SIGNER);
+  });
+});
+
+describe("klines parser (public GET /fapi/v3/klines, REAL)", () => {
+  it("reads string rows into candles sorted by time; malformed rows are skipped and counted (negative)", () => {
+    const rows = [
+      [1763603600000, "1805.0", "1810.5", "1801.2", "1806.3", "12.5", 1763607199999],
+      [1763600000000, "1800.0", "1806.0", "1799.1", "1805.0", "10.1", 1763603599999],
+      [1763607200000, "1806.3", "1801.0", "1809.0", "1807.0", "3", 1763610799999], // low above high
+      ["x", "1", "1", "1", "1", "1", 1],
+      "not a row",
+    ];
+    const { klines, skipped } = parseKlines(rows);
+    expect(skipped).toBe(3);
+    expect(klines).toEqual([
+      { openTime: 1763600000000, high: 1806, low: 1799.1, close: 1805 },
+      { openTime: 1763603600000, high: 1810.5, low: 1801.2, close: 1806.3 },
+    ]);
+    expect(parseKlines({ code: -1121, msg: "Invalid symbol." })).toEqual({ klines: [], skipped: 0 });
   });
 });

@@ -122,8 +122,10 @@ describe("summary helpers", () => {
 
   it("options line by hand: Now, Buy $10 at 30x from 64,000", () => {
     const now = buildSetPlan({ input: { symbol: "BTCUSDT", side: "buy", ticketUsd: 10, leverage: 30, tpMode: "deserved", entryMode: "now" }, currentPrice: 64000, rules: BTC, levels: LEVELS, random: () => 0.5 });
-    // Stop 62,458.7 (2.4% below), target 67,500 (round number, 5.5% above); 0.004 BTC wins $14.0, loses $6.2.
-    expect(optionsLine(30, now)).toBe("30x · target +5.5% ($14.0) · stop -2.4% ($6.2) · entry at market");
+    // Stop 62,458.7 (2.4% below). No candles are passed, so the volatility floor puts every level out of
+    // reach and the target is the bare 2x, 67,082.6 (4.8% above; target v2 of 2026-11-20); 0.004 BTC wins $12.3, loses $6.2.
+    expect(now.takeProfit.source).toBe("exact-ratio");
+    expect(optionsLine(30, now)).toBe("30x · target +4.8% ($12.3) · stop -2.4% ($6.2) · entry at market");
     expect(optionsLine(30, null)).toBe("30x · ...");
   });
 });

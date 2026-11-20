@@ -7,12 +7,14 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { mergeRules, RulesError, setActiveRules, type SetRules } from "../src/rules/rules";
+import { deprecatedKeysIn, mergeRules, RulesError, setActiveRules, type SetRules } from "../src/rules/rules";
 
 export interface LoadedRules {
   rules: SetRules;
   /** The file the override came from, or "defaults (src/rules/defaultRules.ts)". */
   source: string;
+  /** Old keys found in the file, accepted and ignored (deprecation window), e.g. "target.wallSearchReach (replaced by target.windowTop)". */
+  ignored: string[];
 }
 
 export function loadRulesFile(env: Record<string, string | undefined>, root: string): LoadedRules {
@@ -21,7 +23,7 @@ export function loadRulesFile(env: Record<string, string | undefined>, root: str
   if (!existsSync(file)) {
     if (named) throw new RulesError(`SETS_RULES_FILE points to ${file}, which does not exist`);
     setActiveRules();
-    return { rules: mergeRules({}), source: "defaults (src/rules/defaultRules.ts)" };
+    return { rules: mergeRules({}), source: "defaults (src/rules/defaultRules.ts)", ignored: [] };
   }
   let parsed: unknown;
   try {
@@ -36,5 +38,5 @@ export function loadRulesFile(env: Record<string, string | undefined>, root: str
     throw new RulesError(`${file}: ${(e as Error).message}`);
   }
   setActiveRules(rules);
-  return { rules, source: file };
+  return { rules, source: file, ignored: deprecatedKeysIn(parsed) };
 }

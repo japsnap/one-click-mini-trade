@@ -1,0 +1,252 @@
+/**
+ * Building a plan from a request body on the server: fetch the price, symbol rules, order
+ * book, trader levels, candles and the liquidation map, then run buildSetPlan. Used by the
+ * preview and place routes of server/index.ts. Kept apart from index.ts (which starts a
+ * server at import) so tests can drive it with fakes.
+ *
+ * Market data for the target (Sets_Rules.md E2, 2026-11-20):
+ *  - Aster klines, two public calls cached 60 s: one-hour (volatility of the last 72 hours,
+ *    swing high and low of the last 48) and four-hour (swing high and low of the last 42).
+ *  - The liquidation map from HyperliquidLevelSource.getFuelLevels: read from memory, never a
+ *    request (the map refreshes itself in the background).
+ * Both are best effort: without candles the volatility floor is used and the counts say
+ * "not given"; without the map the reason says "liquidation map unavailable".
+ */
+import { appendFile, mkdir } from "node:fs/promises";
+import path from "node:path";
+import { buildSetPlan, type PlanMarket, type SetPlan } from "../src/core/plan";
+import { realizedVol1h, swingLevels } from "../src/core/takeProfit";
+import { parseSetInput } from "../src/core/validate";
+import { seededRandom, type LeverageBracket, type OrderBookDepth, type RandomSource, type SymbolRules, type TraderLevels } from "../src/core/types";
+import type { Kline } from "../src/exchange/aster";
+import { coinFromSymbol, type FuelLevels, type LevelsReport } from "../src/levels/hyperliquid";
+import { activeRules } from "../src/rules/rules";
+
+/** The parts of the Aster client the planner reads (all public). */
+export interface PlannerAster {
+  getPrice(symbol: string): Promise<{ symbol: string; price: number; time: number }>;
+  getSymbolRules(symbol: string): Promise<SymbolRules>;
+  getDepth(symbol: string): Promise<OrderBookDepth & { skipped: number }>;
+  getKlines(symbol: string, interval: "1h" | "4h", limit: number): Promise<Kline[]>;
+}
+
+/** The parts of the level source the planner reads. */
+export interface PlannerLevels {
+  getLevels(coin: string): Promise<{ levels: TraderLevels; report: LevelsReport }>;
+  getFuelLevels(coin: string, price?: number): FuelLevels;
+}
+
+export interface PlannerDeps {
+  aster: PlannerAster;
+  levels: PlannerLevels;
+  /** Leverage brackets (signed, live mode only); null in trial mode. */
+  bracketsFor(symbol: string): Promise<LeverageBracket[] | null>;
+  /** Cryptographic random in [0, 1) for placed Sets. */
+  random: RandomSource;
+  log?: (line: string) => void;
+  warn?: (line: string) => void;
+  now?: () => number;
+}
+
+/** What one plan was built from, printed and returned so a zero is visible. */
+export interface PlanSources {
+  levels: LevelsReport | { unavailable: string } | null;
+  depth: { bids: number; asks: number; skipped: number } | { unavailable: string } | null;
+  klines: { candles1h: number; candles4h: number; sigma1h: number | null; returnsUsed: number; tooFewCandles: boolean; swingHighs: number[]; swingLows: number[] } | { unavailable: string } | null;
+  fuelMap: (FuelLevels["report"] & { status: "ok" | "unavailable"; note: string | null }) | null;
+  maintenance: "brackets" | "assumed";
+  seed: number | null;
+}
+
+/** How long candles stay fresh. */
+const KLINE_TTL_MS = 60_000;
+
+export function createPlanner(deps: PlannerDeps) {
+  const log = deps.log ?? ((l: string) => console.log(l));
+  const warn = deps.warn ?? ((l: string) => console.warn(l));
+  const now = deps.now ?? Date.now;
+  const klineCache = new Map<string, { at: number; klines: Kline[] }>();
+
+  async function klines(symbol: string, interval: "1h" | "4h", limit: number): Promise<Kline[]> {
+    const key = `${symbol}:${interval}:${limit}`;
+    const hit = klineCache.get(key);
+    if (hit && now() - hit.at < KLINE_TTL_MS) return hit.klines;
+    const k = await deps.aster.getKlines(symbol, interval, limit);
+    klineCache.set(key, { at: now(), klines: k });
+    return k;
+  }
+
+  /** Candles and the liquidation map for the target. Best effort, every gap counted. */
+  async function marketFor(symbol: string, price: number): Promise<{ market: PlanMarket; klines: PlanSources["klines"]; fuelMap: PlanSources["fuelMap"] }> {
+    const t = activeRules().target;
+    const market: PlanMarket = {};
+    let k: PlanSources["klines"];
+    try {
+      const [h1, h4] = await Promise.all([klines(symbol, "1h", Math.max(t.volLookbackHours + 1, t.swingLookback["1h"])), klines(symbol, "4h", Math.max(1, t.swingLookback["4h"]))]);
+      const vol = realizedVol1h(h1.map((c) => c.close));
+      const sw = swingLevels(h1, h4);
+      market.sigma1h = vol.tooFewCandles ? null : vol.sigma1h;
+      market.sigmaFloored = vol.floored;
+      market.swingHighs = sw.highs;
+      market.swingLows = sw.lows;
+      k = { candles1h: h1.length, candles4h: h4.length, sigma1h: market.sigma1h, returnsUsed: vol.returnsUsed, tooFewCandles: vol.tooFewCandles, swingHighs: sw.highs, swingLows: sw.lows };
+    } catch (e) {
+      warn(`[klines] ${symbol} candles unavailable for the target, volatility floor used: ${(e as Error).message}`);
+      k = { unavailable: (e as Error).message };
+    }
+    const fuel = deps.levels.getFuelLevels(coinFromSymbol(symbol), price);
+    market.fuel = { levels: fuel.levels, status: fuel.status, note: fuel.note };
+    if (fuel.status === "unavailable") warn(`[levels] ${symbol} ${fuel.note}`);
+    return { market, klines: k, fuelMap: { ...fuel.report, status: fuel.status, note: fuel.note } };
+  }
+
+  /**
+   * Build a plan from a request body. allowSeed: previews may carry {"seed": <integer>} to
+   * reproduce the random picks; placement never does.
+   */
+  async function planFromBody(body: unknown, allowSeed: boolean): Promise<{ plan: SetPlan; sources: PlanSources }> {
+    const input = parseSetInput(body);
+    const seedRaw = (body as { seed?: unknown } | null)?.seed;
+    const seed = allowSeed && Number.isInteger(seedRaw) ? (seedRaw as number) : null;
+    const rnd: RandomSource = seed !== null ? seededRandom(seed) : deps.random;
+    const [{ price }, rules] = await Promise.all([deps.aster.getPrice(input.symbol), deps.aster.getSymbolRules(input.symbol)]);
+    const empty: TraderLevels = { limitLevels: [], takeProfitLevels: [], liquidationLevels: [] };
+    const coin = coinFromSymbol(input.symbol);
+    const sources: PlanSources = { levels: null, depth: null, klines: null, fuelMap: null, maintenance: "assumed", seed };
+    let levels: TraderLevels = empty;
+    let depth: OrderBookDepth | null = null;
+    let market: PlanMarket | undefined;
+    if (input.entryMode !== "draw") {
+      if (input.entryMode === "nearby" || input.entryMode === "patient") {
+        // These modes ARE the traders' levels: a failure here is an error, never a silent "Now".
+        const r = await deps.levels.getLevels(coin);
+        levels = r.levels;
+        sources.levels = r.report;
+      } else {
+        // Now uses traders' orders only for the target; if Hyperliquid is down, Aster's own
+        // book and round numbers still work, so this is best effort (logged).
+        try {
+          const r = await deps.levels.getLevels(coin);
+          levels = r.levels;
+          sources.levels = r.report;
+        } catch (e) {
+          warn(`[levels] ${coin} unavailable for the target, using Aster's book and round numbers: ${(e as Error).message}`);
+          sources.levels = { unavailable: (e as Error).message };
+        }
+      }
+      // Aster's public order book: walls for the target. Best effort.
+      try {
+        const d = await deps.aster.getDepth(input.symbol);
+        depth = d;
+        sources.depth = { bids: d.bids.length, asks: d.asks.length, skipped: d.skipped };
+      } catch (e) {
+        warn(`[depth] ${input.symbol} order book unavailable for the target: ${(e as Error).message}`);
+        sources.depth = { unavailable: (e as Error).message };
+      }
+      const m = await marketFor(input.symbol, price);
+      market = m.market;
+      sources.klines = m.klines;
+      sources.fuelMap = m.fuelMap;
+    } // Draw: the user painted both bands; no levels, book or candles needed.
+    const brackets = await deps.bracketsFor(input.symbol);
+    sources.maintenance = brackets ? "brackets" : "assumed";
+    const plan = buildSetPlan({ input, currentPrice: price, rules, levels, depth, brackets, random: rnd, market });
+    log(countsLine(plan, sources));
+    return { plan, sources };
+  }
+
+  return { planFromBody, marketFor };
+}
+
+/** The structural counts of one plan in one line (entry, target, data sources). */
+export function countsLine(plan: SetPlan, sources: PlanSources): string {
+  const d = plan.diagnostics;
+  const t = d.takeProfit;
+  const fm = sources.fuelMap;
+  const target = t
+    ? `target: fuel levels read ${t.liquidationLevelsRead}, on the profit side ${t.liquidationsOnProfitSide}, in window ${t.liquidationsInWindow}, clusters ${t.clustersFound} (too small ${t.clustersTooSmall}, inside the line ${t.clustersBelowSlackLine}); ` +
+      `book levels ${d.oppositeVolumeLevels.venueBook} + traders ${d.oppositeVolumeLevels.traders}, in window ${t.levelsInWindow}; brakes ${t.brakesFound} (walls ${t.walls}, round ${t.roundNumbers}, swing ${t.swingHighs}, trader tps ${t.traderTakeProfits}); ` +
+      `candidates ${t.candidatesScored} (out of reach ${t.candidatesOutOfReach}, outside window ${t.candidatesOutsideWindow}); sigma1h ${t.sigma1h.toFixed(4)} (${t.sigmaSource}), H ${t.horizonHours} h; ` +
+      `winner ${t.winner ? `${t.winner.kind} pull ${t.winner.pull} reach ${t.winner.reach} pass ${t.winner.pass} score ${t.winner.score}` : "none (bare floor)"}`
+    : "target: drawn";
+  const map = fm ? `; liquidation map ${fm.status}, accounts with fresh answers ${fm.addressesWithFreshAnswer} of ${fm.addressesInSample}` : "";
+  return (
+    `[counts] ${plan.input.symbol} ${plan.input.side} ${plan.input.entryMode}: ` +
+    `liquidations read ${d.entry.liquidationsRead ?? "-"}, on side ${d.entry.liquidationsOnSide ?? "-"}, in window ${d.entry.liquidationsInWindow ?? "-"}; ` +
+    `orders read ${d.entry.ordersRead ?? "-"}, in window ${d.entry.ordersInWindow ?? "-"}, buckets kept ${d.entry.nearbyBucketsKept ?? "-"}; ` +
+    `${target}${map}; maintenance ${sources.maintenance}`
+  );
+}
+
+/**
+ * What a plan was built from, short enough for every plans.jsonl line: the liquidation map's
+ * freshness and request counts, whether candles were there, the book, the trader sample.
+ */
+export function sourcesForLog(s: PlanSources): Record<string, unknown> {
+  const fm = s.fuelMap;
+  const k = s.klines;
+  return {
+    fuelMap: fm
+      ? { status: fm.status, note: fm.note, fresh: fm.addressesWithFreshAnswer, inSample: fm.addressesInSample, asked: fm.addressesAsked, answered: fm.answered, failed: fm.failed, skippedByBudget: fm.skippedByBudget, levelsOnCoin: fm.liquidationLevels }
+      : null,
+    klines: k === null ? null : "unavailable" in k ? { available: false, error: k.unavailable } : { available: true, candles1h: k.candles1h, candles4h: k.candles4h, sigma1h: k.sigma1h, tooFewCandles: k.tooFewCandles },
+    depth: s.depth,
+    levels: s.levels === null ? null : "unavailable" in s.levels ? s.levels : { positionAddressesOk: s.levels.positionAddressesOk, orderAddressesOk: s.levels.orderAddressesOk, skippedByRateBudget: s.levels.skippedByRateBudget, fromCache: s.levels.fromCache },
+    maintenance: s.maintenance,
+    seed: s.seed,
+  };
+}
+
+/**
+ * The line one plan adds to logs/plans.jsonl: the orders, the stop, and the target with its
+ * reason, its top 5 candidates by score and its counts.
+ */
+export function planLogLine(kind: "preview" | "place", plan: SetPlan, extra: Record<string, unknown> = {}, at = new Date()): Record<string, unknown> {
+  return {
+    at: at.toISOString(),
+    kind,
+    symbol: plan.input.symbol,
+    side: plan.input.side,
+    ticketUsd: plan.input.ticketUsd,
+    leverage: plan.input.leverage,
+    entryMode: `${plan.entry.requestedMode}->${plan.entry.usedMode}`,
+    orders: plan.orders,
+    liquidation: plan.liquidationPrice,
+    stop: plan.stop,
+    takeProfit: {
+      price: plan.takeProfit.price,
+      ratio: plan.takeProfit.ratio,
+      source: plan.takeProfit.source,
+      reason: plan.takeProfit.reason,
+      candidates: plan.takeProfit.candidates.map((c) => ({
+        kind: c.kind,
+        price: c.price,
+        ratio: round(c.ratio, 4),
+        pull: round(c.pull, 4),
+        reach: round(c.reach, 5),
+        pass: round(c.pass, 4),
+        score: round(c.score, 4),
+        weightUsd: Math.round(c.weightUsd),
+        traders: c.traders,
+      })),
+      counts: plan.takeProfit.counts,
+    },
+    ...extra,
+  };
+}
+
+/** Append one plan line to <dir>/plans.jsonl and print a one-line summary with the reason. */
+export async function appendPlanLog(dir: string, kind: "preview" | "place", plan: SetPlan, extra: Record<string, unknown> = {}, log: (l: string) => void = (l) => console.log(l)): Promise<Record<string, unknown>> {
+  const line = planLogLine(kind, plan, extra);
+  log(
+    `[plan] ${kind} ${plan.input.symbol} ${plan.input.side} $${plan.input.ticketUsd} ${plan.input.leverage}x ${line.entryMode} entries=${plan.orders.entries.length} tp=${plan.takeProfit.price} (${plan.takeProfit.source}) stop=${plan.stop.price} ratio=${plan.takeProfit.ratio.toFixed(2)}: ${plan.takeProfit.reason}`,
+  );
+  await mkdir(dir, { recursive: true });
+  await appendFile(path.join(dir, "plans.jsonl"), JSON.stringify(line) + "\n");
+  return line;
+}
+
+function round(x: number, places: number): number {
+  const f = 10 ** places;
+  return Math.round(x * f) / f;
+}

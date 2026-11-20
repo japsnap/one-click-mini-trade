@@ -8,7 +8,7 @@
  *
  * Routes:
  *   GET  /api/price?symbol=BTCUSDT        latest Aster price
- *   GET  /api/levels?coin=BTC             skilled traders' levels from Hyperliquid
+ *   GET  /api/levels?coin=BTC             skilled traders' levels from Hyperliquid, plus the liquidation map's counts
  *   POST /api/set/preview                 full order plan, nothing sent (optional "seed": an integer, reproduces the random picks)
  *   POST /api/set/place                   trial by default ("trial: not sent");
  *                                         live only when LIVE_TRADING=true, ticket <= MAX_LIVE_TICKET_USD
@@ -23,15 +23,17 @@
  * It never resizes exits (handleOrderUpdate does; Blackboard's backend runs that).
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { randomInt } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildSetPlan, type SetPlan } from "../src/core/plan";
-import { InvalidSetInputError, parseSetInput } from "../src/core/validate";
-import { seededRandom, type LeverageBracket, type OrderBookDepth, type RandomSource, type TraderLevels } from "../src/core/types";
+import type { SetPlan } from "../src/core/plan";
+import { InvalidSetInputError } from "../src/core/validate";
+import type { LeverageBracket } from "../src/core/types";
 import { AsterClient, privateKeySigner } from "../src/exchange/aster";
-import { HyperliquidLevelSource, coinFromSymbol, type LevelsReport } from "../src/levels/hyperliquid";
+import { HyperliquidLevelSource } from "../src/levels/hyperliquid";
+import { activeRules } from "../src/rules/rules";
+import { appendPlanLog, createPlanner, sourcesForLog } from "./planning";
 import { ConfigError, describeConfig, loadConfig } from "./config";
 import { describeLedger, executeLive, planToSetLegs, preTradeCheck } from "./execute";
 import { parsePositionRows } from "../src/exchange/aster";
@@ -54,6 +56,7 @@ let loadedRules: LoadedRules;
 try {
   loadedRules = loadRulesFile(process.env, ROOT);
   console.log(`[rules] ${loadedRules.source}`);
+  for (const k of loadedRules.ignored) console.warn(`[rules] ${k} is no longer used and is ignored; remove it from the rules file`);
 } catch (e) {
   console.error(`[rules] ${(e as Error).message}`);
   process.exit(1);
@@ -80,7 +83,9 @@ const aster = new AsterClient({
 });
 
 // Hyperliquid levels, with the trimmed leaderboard cached on disk for 6 hours.
-// Trader sets and the rate budget use the source's defaults (src/levels/hyperliquid.ts).
+// Trader sets and the rate budget use the source's defaults (src/levels/hyperliquid.ts);
+// the liquidation map (fuel map) for the target follows the rules and refreshes itself in
+// the background (public reads only, also in trial mode).
 const cacheFile = path.join(ROOT, ".cache", "hl-leaderboard.json");
 const levelsSource = new HyperliquidLevelSource({
   diskCache: {
@@ -90,6 +95,7 @@ const levelsSource = new HyperliquidLevelSource({
       await writeFile(cacheFile, t);
     },
   },
+  fuelMap: { topN: activeRules().target.fuelMapTopN, refreshMinutes: activeRules().target.fuelMapRefreshMinutes },
 });
 
 /** The Set ledger of this server's one account (server/ledgerFile.ts). */
@@ -98,27 +104,9 @@ const ledgerStore = fileLedgerStore(path.join(ROOT, "logs", "set-ledger.json"));
 /** Cryptographic random in [0, 1) for the price nudge. */
 const random = () => randomInt(0, 2 ** 31) / 2 ** 31;
 
-/** Append one plan to logs/plans.jsonl and print a one-line summary. */
-async function logPlan(kind: "preview" | "place", plan: SetPlan, extra: Record<string, unknown> = {}) {
-  const line = {
-    at: new Date().toISOString(),
-    kind,
-    symbol: plan.input.symbol,
-    side: plan.input.side,
-    ticketUsd: plan.input.ticketUsd,
-    leverage: plan.input.leverage,
-    entryMode: `${plan.entry.requestedMode}->${plan.entry.usedMode}`,
-    orders: plan.orders,
-    liquidation: plan.liquidationPrice,
-    stop: plan.stop,
-    takeProfit: plan.takeProfit,
-    ...extra,
-  };
-  console.log(
-    `[plan] ${kind} ${line.symbol} ${line.side} $${line.ticketUsd} ${line.leverage}x ${line.entryMode} entries=${plan.orders.entries.length} tp=${plan.takeProfit.price} (${plan.takeProfit.source}) stop=${plan.stop.price} ratio=${plan.takeProfit.ratio.toFixed(2)}`,
-  );
-  await mkdir(path.join(ROOT, "logs"), { recursive: true });
-  await appendFile(path.join(ROOT, "logs", "plans.jsonl"), JSON.stringify(line) + "\n");
+/** Append one plan to logs/plans.jsonl (server/planning.ts) and print a one-line summary with the target's reason. */
+function logPlan(kind: "preview" | "place", plan: SetPlan, extra: Record<string, unknown> = {}) {
+  return appendPlanLog(path.join(ROOT, "logs"), kind, plan, extra);
 }
 
 /**
@@ -136,72 +124,9 @@ async function bracketsFor(symbol: string): Promise<LeverageBracket[] | null> {
   return brackets;
 }
 
-/** What one plan was built from, printed and returned so a zero is visible. */
-interface PlanSources {
-  levels: LevelsReport | { unavailable: string } | null;
-  depth: { bids: number; asks: number; skipped: number } | { unavailable: string } | null;
-  maintenance: "brackets" | "assumed";
-  seed: number | null;
-}
-
-/**
- * Build a plan from a request body, fetching price, rules, levels and the order book.
- * allowSeed: previews may carry {"seed": <integer>} to reproduce the random picks exactly;
- * placement never does (a placed Set always draws fresh cryptographic randomness).
- */
-async function planFromBody(body: unknown, allowSeed: boolean): Promise<{ plan: SetPlan; sources: PlanSources }> {
-  const input = parseSetInput(body);
-  const seedRaw = (body as { seed?: unknown } | null)?.seed;
-  const seed = allowSeed && Number.isInteger(seedRaw) ? (seedRaw as number) : null;
-  const rnd: RandomSource = seed !== null ? seededRandom(seed) : random;
-  const [{ price }, rules] = await Promise.all([aster.getPrice(input.symbol), aster.getSymbolRules(input.symbol)]);
-  const empty: TraderLevels = { limitLevels: [], takeProfitLevels: [], liquidationLevels: [] };
-  const coin = coinFromSymbol(input.symbol);
-  const sources: PlanSources = { levels: null, depth: null, maintenance: "assumed", seed };
-  let levels: TraderLevels = empty;
-  let depth: OrderBookDepth | null = null;
-  if (input.entryMode !== "draw") {
-    if (input.entryMode === "nearby" || input.entryMode === "patient") {
-      // These modes ARE the traders' levels: a failure here is an error, never a silent "Now".
-      const r = await levelsSource.getLevels(coin);
-      levels = r.levels;
-      sources.levels = r.report;
-    } else {
-      // Now uses traders' orders only for the take-profit zone; if Hyperliquid is down,
-      // Aster's own book and round numbers still work, so this is best effort (logged).
-      try {
-        const r = await levelsSource.getLevels(coin);
-        levels = r.levels;
-        sources.levels = r.report;
-      } catch (e) {
-        console.warn(`[levels] ${coin} unavailable for the take-profit zone, using Aster's book and round numbers: ${(e as Error).message}`);
-        sources.levels = { unavailable: (e as Error).message };
-      }
-    }
-    // Aster's public order book feeds the take-profit volume zone. Best effort: without it
-    // the zone uses traders' orders only, then the round-number fallback.
-    try {
-      const d = await aster.getDepth(input.symbol);
-      depth = d;
-      sources.depth = { bids: d.bids.length, asks: d.asks.length, skipped: d.skipped };
-    } catch (e) {
-      console.warn(`[depth] ${input.symbol} order book unavailable for the take-profit zone: ${(e as Error).message}`);
-      sources.depth = { unavailable: (e as Error).message };
-    }
-  } // Draw: the user painted both bands; no levels or book needed.
-  const brackets = await bracketsFor(input.symbol);
-  sources.maintenance = brackets ? "brackets" : "assumed";
-  const plan = buildSetPlan({ input, currentPrice: price, rules, levels, depth, brackets, random: rnd });
-  const d = plan.diagnostics;
-  console.log(
-    `[counts] ${input.symbol} ${input.side} ${input.entryMode}: ` +
-      `liquidations read ${d.entry.liquidationsRead ?? "-"}, on side ${d.entry.liquidationsOnSide ?? "-"}, in window ${d.entry.liquidationsInWindow ?? "-"}; ` +
-      `orders read ${d.entry.ordersRead ?? "-"}, in window ${d.entry.ordersInWindow ?? "-"}, buckets kept ${d.entry.nearbyBucketsKept ?? "-"}; ` +
-      `tp zone levels venue ${d.oppositeVolumeLevels.venueBook} + traders ${d.oppositeVolumeLevels.traders}, in window ${d.takeProfitZone?.levelsInWindow ?? "-"}, ` +
-      `buckets ${d.takeProfitZone?.bucketsInWindow ?? "-"}, heaviest $${Math.round(d.takeProfitZone?.heaviestBucketUsd ?? 0)}; maintenance ${sources.maintenance}`,
-  );
-  return { plan, sources };
-}
+/** Builds plans from request bodies: price, rules, book, levels, candles and the liquidation map (server/planning.ts). */
+const planner = createPlanner({ aster, levels: levelsSource, bracketsFor, random });
+const planFromBody = planner.planFromBody;
 
 /** Read a JSON body (max 64 KB). */
 async function readJson(req: IncomingMessage): Promise<unknown> {
@@ -248,9 +173,13 @@ const server = createServer(async (req, res) => {
       const coin = (url.searchParams.get("coin") ?? "BTC").toUpperCase();
       if (!/^[A-Z0-9]{1,15}$/.test(coin)) return send(res, 400, { error: "coin must look like BTC" });
       const { levels, report } = await levelsSource.getLevels(coin);
+      // The liquidation map's counts around the current price (read from memory, no request to Hyperliquid).
+      const price = await aster.getPrice(`${coin}USDT`).then((p) => p.price).catch(() => undefined);
+      const fuel = levelsSource.getFuelLevels(coin, price);
       return send(res, 200, {
         coin,
         report,
+        fuelMap: { status: fuel.status, note: fuel.note, price: price ?? null, ...fuel.report },
         counts: {
           limitLevels: levels.limitLevels.length,
           takeProfitLevels: levels.takeProfitLevels.length,
@@ -262,7 +191,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/set/preview") {
       const { plan, sources } = await planFromBody(await readJson(req), true);
       const rules = await aster.getSymbolRules(plan.input.symbol);
-      await logPlan("preview", plan);
+      await logPlan("preview", plan, { sources: sourcesForLog(sources) });
       // With keys set, run the same read-only checks a live Set must pass, so the card can
       // show the refusal (coin already holds a position) or warnings before the tap.
       let check: unknown = null;
@@ -284,7 +213,7 @@ const server = createServer(async (req, res) => {
       if (plan.input.ticketUsd > cfg.maxLiveTicketUsd) why.push(`ticket $${plan.input.ticketUsd} is above MAX_LIVE_TICKET_USD`);
       if (!cfg.liveSymbols.includes(plan.input.symbol)) why.push(`${plan.input.symbol} is not one of ${cfg.liveSymbols.join(", ")}`);
       if (why.length > 0) {
-        await logPlan("place", plan, { status: "trial: not sent", why });
+        await logPlan("place", plan, { status: "trial: not sent", why, sources: sourcesForLog(sources) });
         // The legs a live Set would carry, with a Set id so the client order ids are visible (one-way mode assumed).
         const trialId = newSetId(Date.now(), random);
         return send(res, 200, { status: "trial: not sent", trial: true, why, plan, sources, setId: trialId, asterOrders: planToSetLegs(plan, rules, false, trialId, { reduceOnlyExits: cfg.reduceOnlyExits }) });
@@ -292,7 +221,7 @@ const server = createServer(async (req, res) => {
       const result = await executeLive(aster, plan, rules, { store: ledgerStore, random, reduceOnlyExits: cfg.reduceOnlyExits });
       for (const l of result.log) console[l.level === "error" ? "error" : l.level === "warn" ? "warn" : "log"](`[sets] ${l.message}`);
       const status = result.ok ? "sent" : result.refused ? "refused" : "failed";
-      await logPlan("place", plan, { status, result });
+      await logPlan("place", plan, { status, result, sources: sourcesForLog(sources) });
       // Refused = nothing was sent (the coin already holds a position or a Set, balance, liquidation rules).
       return send(res, result.ok ? 200 : result.refused ? 409 : 502, { status, trial: false, plan, result });
     }
@@ -330,6 +259,7 @@ if (cfg.liveTrading && cfg.credentials) {
   const watcher = new SetWatcher({ client: aster, store: ledgerStore, reduceOnlyExits: cfg.reduceOnlyExits, log: fileWatchLog(path.join(ROOT, "logs", "watch.jsonl")) });
   await watcher.start();
 }
+levelsSource.startFuelMap();
 server.listen(cfg.port, "127.0.0.1", () => {
   console.log(`[server] http://127.0.0.1:${cfg.port} ${describeConfig(cfg)}`);
 });

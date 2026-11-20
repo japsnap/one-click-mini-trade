@@ -45,6 +45,7 @@ import type { SymbolRules } from "../src/core/types";
 import { activeRules } from "../src/rules/rules";
 import { checkCoinIsFree, checkNewSetRisk, parseAccountRisk, type RiskVerdict } from "../src/core/risk";
 import { formatToStep, isOnStep } from "../src/core/rounding";
+import { cleanRatio, remeasureAfterFill } from "../src/core/takeProfit";
 import {
   activeSets,
   applyOrderUpdate,
@@ -284,6 +285,7 @@ export async function executeLive(
         takeProfitPrice: (placed.orders.takeProfits[i] as { stopPrice: number }).stopPrice,
         stopPrice: (placed.orders.stops[i] as { stopPrice: number }).stopPrice,
       })),
+      target: placed.takeProfit.basis ? { reason: placed.takeProfit.reason, planRatio: placed.takeProfit.ratio, basis: placed.takeProfit.basis } : null,
     });
     ledger.sets.push(record);
     await opts.store.save(ledger); // saved BEFORE sending: no untracked order after a crash
@@ -369,7 +371,17 @@ export async function handleOrderUpdate(
   client: AsterClient,
   update: OrderUpdate,
   rules: SymbolRules,
-  opts: { store: LedgerStore; now?: () => number; maintenanceMarginRate?: number },
+  opts: {
+    store: LedgerStore;
+    now?: () => number;
+    maintenanceMarginRate?: number;
+    /**
+     * After a fill, re-place the take-profit when the re-measure (A7) finds a better level.
+     * Default false: updateStrategyOrder is unproven live, so the target is kept and the
+     * better level only logged ("kept, update unproven").
+     */
+    replaceTakeProfitAfterFill?: boolean;
+  },
 ): Promise<{ log: LedgerLog[]; actions: LedgerAction[]; needsReconcile: boolean; matched: boolean }> {
   return withLedgerLock(opts.store, async () => {
     const now = opts.now ?? Date.now;
@@ -387,6 +399,7 @@ export async function handleOrderUpdate(
     ledger = await performCancels(client, ledger, step.actions, log);
     if (step.actions.some((a) => a.kind === "syncExits")) {
       ledger = await syncSetExits(client, ledger, rules, log, { maintenanceMarginRate: opts.maintenanceMarginRate });
+      ledger = await remeasureTargets(client, ledger, rules, log, { replaceTakeProfit: opts.replaceTakeProfitAfterFill === true });
     }
     await opts.store.save(ledger);
     return { log, actions: step.actions, needsReconcile: step.needsReconcile, matched: step.matched };
@@ -415,7 +428,10 @@ export async function reconcileSymbol(
     ledger = step.ledger;
     const log = [...step.log];
     ledger = await performCancels(client, ledger, step.actions, log);
-    if (opts.refreshStops !== false) ledger = await syncSetExits(client, ledger, rules, log, { rows, maintenanceMarginRate: opts.maintenanceMarginRate });
+    if (opts.refreshStops !== false) {
+      ledger = await syncSetExits(client, ledger, rules, log, { rows, maintenanceMarginRate: opts.maintenanceMarginRate });
+      ledger = await remeasureTargets(client, ledger, rules, log); // log only: the re-place belongs to handleOrderUpdate
+    }
     await opts.store.save(ledger);
     const cancels = step.actions.filter((a) => a.kind === "cancel").length;
     log.push({ level: step.mismatches.length ? "error" : "info", message: `[counts] reconcile ${rules.symbol}: open Sets ${open.length}, mismatches ${step.mismatches.length}, cancels ${cancels}` });
@@ -536,6 +552,100 @@ export async function syncSetExits(
 }
 
 /**
+ * The target against the real fill (Sets_Rules.md A7). For every open single-entry Set with
+ * a stored target, after syncSetExits has re-set its stop from the fill:
+ *   ratio = |take-profit - average fill| / |average fill - stop|.
+ * At or above the slack line (floor - 0.1): nothing moves. Below it, the target is chosen
+ * again from the stored candidates (remeasureAfterFill). A different winner is re-placed
+ * with updateStrategyOrder only when opts.replaceTakeProfit is true; otherwise the target
+ * stays and the log says "kept, update unproven" with the level it would have used.
+ * Never touches the entry or the stop. Runs once per (fill, stop) pair, so a repeated
+ * event does not repeat the log.
+ */
+export async function remeasureTargets(
+  client: AsterClient,
+  ledger0: SetLedger,
+  rules: SymbolRules,
+  log: LedgerLog[],
+  opts: { replaceTakeProfit?: boolean } = {},
+): Promise<SetLedger> {
+  const ledger = structuredClone(ledger0);
+  let measured = 0;
+  let moved = 0;
+  for (const set of ledger.sets) {
+    if (set.symbol !== rules.symbol || set.status !== "open" || !set.target || set.legs.length !== 1) continue;
+    const leg = set.legs[0] as SetLeg;
+    if (!(legOpenQty(leg) > 0)) continue;
+    const fill = averagePrice(leg.entry);
+    if (!(fill > 0)) continue;
+    // Already measured at this (fill, stop): skip, unless a better level is still pending and
+    // re-placing is on now (a log-only pass, e.g. reconcileSymbol, may have stamped the pair first).
+    const samePair = set.target.measuredAtFill === cleanRatio(fill) && set.target.measuredAtStop === leg.stop.stopPrice;
+    if (samePair && !(opts.replaceTakeProfit && set.target.pendingPrice != null)) continue;
+
+    let r;
+    try {
+      r = remeasureAfterFill({ basis: set.target.basis, side: set.side, fill, stopPrice: leg.stop.stopPrice, takeProfitPrice: leg.takeProfit.stopPrice, tickSize: rules.tickSize });
+    } catch (e) {
+      log.push({ level: "error", setId: set.id, message: `target re-measure failed, target kept: ${(e as Error).message}` });
+      continue;
+    }
+    measured++;
+    set.target.measuredAtFill = cleanRatio(fill);
+    set.target.measuredAtStop = leg.stop.stopPrice;
+    set.target.realRatio = r.realRatio;
+    if (r.action !== "re-choose" || !r.choice) {
+      set.target.lastCheck = r.message;
+      log.push({ level: r.action === "keep" ? "info" : "warn", setId: set.id, message: r.message });
+      continue;
+    }
+    const next = r.choice;
+    if (!opts.replaceTakeProfit) {
+      set.target.pendingPrice = next.price;
+      set.target.lastCheck = `kept, update unproven: ${r.message}`;
+      log.push({ level: "warn", setId: set.id, message: `kept, update unproven: ${r.message} (would re-place at ${next.price}, ${next.ratio.toFixed(2)}x)` });
+      continue;
+    }
+    if (!leg.strategyId) {
+      set.needsAttention = `target re-choice ${next.price} not placed: the leg's strategyId is unknown`;
+      set.target.pendingPrice = next.price;
+      log.push({ level: "error", setId: set.id, message: set.needsAttention });
+      continue;
+    }
+    const closeSide: "BUY" | "SELL" = set.side === "buy" ? "SELL" : "BUY";
+    const positionSide = set.positionMode === "hedge" ? (set.side === "buy" ? ("LONG" as const) : ("SHORT" as const)) : undefined;
+    try {
+      await client.updateStrategyOrder(leg.strategyId, "OTOCO", [
+        {
+          strategySubId: "2",
+          securityType: "USDT_FUTURES",
+          symbol: set.symbol,
+          side: closeSide,
+          type: "TAKE_PROFIT_MARKET",
+          quantity: formatToStep(leg.takeProfit.qty, rules.stepSize),
+          stopPrice: formatToStep(next.price, rules.tickSize),
+          workingType: "MARK_PRICE",
+          ...(positionSide ? { positionSide } : {}),
+        },
+      ]);
+      moved++;
+      leg.takeProfit.stopPrice = next.price;
+      set.target.realRatio = next.ratio;
+      set.target.pendingPrice = null;
+      set.target.lastCheck = `re-placed: ${r.message}`;
+      log.push({ level: "info", setId: set.id, message: `re-placed take-profit at ${next.price} (${next.ratio.toFixed(2)}x against the real fill): ${r.message}` });
+    } catch (e) {
+      set.needsAttention = `take-profit re-place failed: ${(e as Error).message}`;
+      set.target.pendingPrice = next.price;
+      set.target.lastCheck = `kept, update failed: ${r.message}`;
+      log.push({ level: "error", setId: set.id, message: `TAKE-PROFIT RE-PLACE FAILED, kept at ${leg.takeProfit.stopPrice}: ${(e as Error).message}` });
+    }
+  }
+  log.push({ level: "info", message: `[counts] remeasureTargets ${rules.symbol}: measured ${measured}, re-placed ${moved}` });
+  return ledger;
+}
+
+/**
  * Learn Aster's orderIds (and strategyIds) of every active Set leg on a symbol from
  * GET /fapi/v3/strategyOpenOrder, so events can be matched by orderId when Aster does not
  * echo our client ids. Best effort: a failed query is logged, never thrown.
@@ -574,5 +684,26 @@ export function describeLedger(ledger: SetLedger) {
     status: s.status,
     needsAttention: s.needsAttention,
     pnl: setPnl(s),
+    target: describeTarget(s),
   }));
+}
+
+/**
+ * The target of one Set for a list screen: its reason, the planned ratio and the ratio
+ * against the real fill ("1.97x against the real fill"), computed from the ledger as it is
+ * (so it works for Sets the demo server's watcher only records). null for Draw and old Sets.
+ */
+export function describeTarget(s: SetRecord): { reason: string; planRatio: number; realRatio: number | null; realRatioText: string | null; pendingPrice: number | null } | null {
+  if (!s.target || s.legs.length !== 1) return null;
+  const leg = s.legs[0] as SetLeg;
+  const fill = averagePrice(leg.entry);
+  const dist = Math.abs(fill - leg.stop.stopPrice);
+  const realRatio = fill > 0 && dist > 0 ? cleanRatio(Math.abs(leg.takeProfit.stopPrice - fill) / dist) : null;
+  return {
+    reason: s.target.reason,
+    planRatio: s.target.planRatio,
+    realRatio,
+    realRatioText: realRatio === null ? null : `${realRatio.toFixed(2)}x against the real fill`,
+    pendingPrice: s.target.pendingPrice ?? null,
+  };
 }

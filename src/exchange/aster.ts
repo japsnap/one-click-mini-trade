@@ -290,6 +290,35 @@ export function parseDepth(json: unknown): OrderBookDepth & { skipped: number } 
   return { bids: side(o.bids), asks: side(o.asks), skipped };
 }
 
+/** One candle of Aster's public klines. Units: prices quote per base; openTime ms since 1970. */
+export interface Kline {
+  openTime: number;
+  high: number;
+  low: number;
+  close: number;
+}
+
+/**
+ * Parse GET /fapi/v3/klines: an array of arrays [openTime, open, high, low, close, volume,
+ * closeTime, ...] with prices as strings (V3 doc "Kline/Candlestick Data"). Every row is
+ * coerced; a malformed row is skipped and counted.
+ */
+export function parseKlines(json: unknown): { klines: Kline[]; skipped: number } {
+  const out: Kline[] = [];
+  let skipped = 0;
+  for (const r of Array.isArray(json) ? json : []) {
+    const row = Array.isArray(r) ? r : [];
+    const k = { openTime: num(row[0]), high: num(row[2]), low: num(row[3]), close: num(row[4]) };
+    if (!(k.openTime > 0) || !(k.high > 0) || !(k.low > 0) || !(k.close > 0) || k.low > k.high) {
+      skipped++;
+      continue;
+    }
+    out.push(k);
+  }
+  out.sort((a, b) => a.openTime - b.openTime);
+  return { klines: out, skipped };
+}
+
 /**
  * Parse signed GET /fapi/v3/leverageBrackets for one symbol into LeverageBracket rows.
  * Accepts both documented shapes: an array of {symbol, brackets} or one {symbol, brackets}.
@@ -620,6 +649,18 @@ export class AsterClient {
     if (depth.bids.length === 0 && depth.asks.length === 0) throw new Error(`Aster depth for ${symbol} came back empty`);
     this.depthCache.set(key, { at: Date.now(), depth });
     return depth;
+  }
+
+  /**
+   * Public candles, GET /fapi/v3/klines (weight 1 for limits up to 100). Used by the target:
+   * hourly volatility from the one-hour closes, swing highs and lows from both intervals.
+   * Throws when the answer holds no usable candle.
+   */
+  async getKlines(symbol: string, interval: "1h" | "4h", limit: number): Promise<Kline[]> {
+    const j = await this.send("GET", "/fapi/v3/klines", pyUrlencode([["symbol", symbol], ["interval", interval], ["limit", String(limit)]]));
+    const { klines } = parseKlines(j);
+    if (klines.length === 0) throw new Error(`Aster klines for ${symbol} ${interval} came back empty`);
+    return klines;
   }
 
   /** Latest trade price. Units: quote per base. */
