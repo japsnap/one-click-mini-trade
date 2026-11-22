@@ -106,6 +106,7 @@ What Blackboard receives is this setup plus a default rule set it can change; ea
 
 ## Risk notes
 
+- **Not financial advice, no warranty.** This is sample code for builders. Leveraged trading can lose the whole ticket. Use it at your own risk.
 - **Stop just before liquidation.** The stop is a stop-market order: in a sudden gap it can fill worse than its price, and if price jumps past liquidation the venue liquidates instead. On isolated margin the loss is still capped by the margin; on cross margin only the stop caps it. A Set never switches the coin to isolated margin (that setting belongs to the user's Blackboard app), so on a cross-margin account the stop is the only cap.
 - **Plain exits in one-way mode.** An exit that is not reduce-only, left behind after a hand close, would open a new position when it triggers; the watcher cancels it within about 15 to 30 seconds. Reduce-only exits would close that gap (see "Open items").
 - **The max loss shown is the loss at the stop**, before exchange trading fees and funding. With a $10 ticket at 30x it is about $6.20 (smoke run 2026-11-16), because the quantity is rounded down to Aster's 0.001 BTC step and the stop sits at 85% of a distance already shortened by the maintenance margin.
