@@ -305,6 +305,8 @@ export interface TakeProfitPick {
   source: TpSource;
   /** One plain sentence: where the target sits and why. */
   reason: string;
+  /** The card's short version of the reason: a few plain words, no prices beyond the level's own. */
+  why: string;
   /** The top 5 by score (in the race only), for the log and the card. */
   candidates: ScoredCandidate[];
   /** Every candidate with its score or the reason it was dropped. */
@@ -776,6 +778,7 @@ export function chooseTarget(args: {
     stopPrice: args.stopPrice,
     source,
     reason: "",
+    why: "",
     candidates: top5,
     scored,
     brakes: args.brakes,
@@ -786,6 +789,7 @@ export function chooseTarget(args: {
   };
   pick.wouldHaveWon = wouldHaveWon;
   pick.reason = targetReason({ pick, best, side, tickSize, stuckBehind, clustersFound, scored, entry, wouldHaveWon });
+  pick.why = targetWhy(pick, best, side, tickSize);
   return pick;
 }
 
@@ -865,6 +869,31 @@ function pctBehind(b: Brake, price: number, side: Side): string {
  *   "Long from 1,805.73; take profit (sell) at 1,949.41, 3.02x the stop (sell at 1,758.19): the sale sits just in front of 1,950 (a round number) at the edge of a cluster where $2.5M of 3 accounts' shorts get liquidated (1,950.4 to 1,951.9; the largest holds 36%)"
  *   "Short from 1,764.96; take profit (buy back) at 1,667.52, 2.29x the stop (buy back at 1,807.46): the buy-back sits just inside a cluster where ..."
  */
+/**
+ * The card's reason in a few plain words (Shota 2026-11-22: "Brief reason no jargon. Art is to say in
+ * small number of words."). It names what the exit sits in front of; the long sentence stays in the log.
+ */
+export function targetWhy(pick: TakeProfitPick, best: ScoredCandidate | null, side: Side, tickSize: number): string {
+  const long = side === "buy";
+  const b = pick.pulledInFrontOf ?? (best && best.kind !== "liquidation-cluster" ? best.brake : null);
+  if (!pick.pulledInFrontOf && best?.kind === "liquidation-cluster" && best.cluster) {
+    return `Just before ${fmtUsdShort(best.cluster.notionalUsd)} of other traders' ${long ? "shorts" : "longs"} get force-closed.`;
+  }
+  if (b) {
+    switch (b.kind) {
+      case "wall":
+        return `Just before a ${fmtUsdShort(b.restingUsd)} stack of ${long ? "sell" : "buy"} orders.`;
+      case "round-number":
+        return `Just before the round number ${fmtPrice(b.price, tickSize)}.`;
+      case "swing":
+        return long ? "Just below the recent high." : "Just above the recent low.";
+      case "trader-tp":
+        return "Where skilled traders take profit.";
+    }
+  }
+  return `Nothing in the way, so ${fmtX(pick.ratio)} the stop distance.`;
+}
+
 export function targetReason(a: {
   pick: TakeProfitPick;
   best: ScoredCandidate | null;

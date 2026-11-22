@@ -109,6 +109,8 @@ export interface SetPlan {
     source: TpSource | "drawn";
     /** One plain sentence: where the target sits and why (shown on the card, logged). */
     reason: string;
+    /** The card's few-word reason ("" for a drawn Set). */
+    why: string;
     /** The top 5 levels by score, with their score parts. Empty for Draw. */
     candidates: ScoredCandidate[];
     /** Structural counts of the pick. null for Draw. */
@@ -211,7 +213,7 @@ export function buildSetPlan(args: {
       quantity: d.totalQty,
       liquidationPrice: d.liquidationPrice,
       stop: { price: avgStop, fractionOfLiquidation: o.stopFraction ?? activeRules().stop.fractionOfLiquidation, maintenanceMarginRate: mm.rate, maintenanceSource: mm.source },
-      takeProfit: { price: avgTp, ratio: d.minRatio, source: "drawn", reason: "drawn by the user across the Out band", candidates: [], counts: null, basis: null },
+      takeProfit: { price: avgTp, ratio: d.minRatio, source: "drawn", reason: "drawn by the user across the Out band", why: "", candidates: [], counts: null, basis: null },
       expected: {
         profitAtTpUsd: round2(profit),
         lossAtStopUsd: -round2(d.lossAtStopsUsd),
@@ -311,7 +313,7 @@ export function buildSetPlan(args: {
       maintenanceMarginRate: stop.maintenanceMarginRate,
       maintenanceSource: stop.maintenanceSource,
     },
-    takeProfit: { price: tp.price, ratio: tp.ratio, source: tp.source, reason: tp.reason, candidates: tp.candidates, counts: tp.counts, basis: tp.basis, wouldHaveWon: tp.wouldHaveWon ?? null },
+    takeProfit: { price: tp.price, ratio: tp.ratio, source: tp.source, reason: tp.reason, why: tp.why, candidates: tp.candidates, counts: tp.counts, basis: tp.basis, wouldHaveWon: tp.wouldHaveWon ?? null },
     expected: {
       profitAtTpUsd: profit,
       lossAtStopUsd: -round2(qty * stop.riskDistance),
@@ -408,6 +410,7 @@ export function withSymbolLeverage(plan: SetPlan, rules: SymbolRules, symbolLeve
       ratio: pick.ratio,
       source: pick.source,
       reason: `${pick.reason} (re-chosen for the symbol's ${symbolLeverage}x, which pulls the stop in)`,
+      why: pick.why,
       candidates: pick.candidates,
       counts: pick.counts,
       basis: pick.basis,

@@ -182,6 +182,7 @@ export function SetCard({ api, symbol = "BTCUSDT", onAlert }: SetCardProps) {
             <Kv k="Entry" v={plan.entry.usedMode === "now" ? `market ~${px(plan.entry.expectedFillPrice)}` : px(plan.entry.expectedFillPrice)} />
             <Kv k="Orders" v={`${plan.orders.entries.length} in / ${plan.orders.takeProfits.length} out / ${plan.orders.stops.length} stop`} />
             <Kv k="Take-profit" v={`${px(plan.takeProfit.price)} (${plan.takeProfit.ratio.toFixed(2)}x)`} tone={theme.color.success} />
+            {plan.takeProfit.why && <Muted data-testid="tp-why">{plan.takeProfit.why}</Muted>}
             <Kv k="Stop" v={px(plan.stop.price)} tone={theme.color.negative} />
             <Kv k="Liquidation" v={px(plan.liquidationPrice)} tone={theme.color.dim} />
             <Kv k="Win / max loss" v={`${usd(plan.expected.profitAtTpUsd)} / ${usd(plan.expected.lossAtStopUsd)}`} />
