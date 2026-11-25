@@ -44,6 +44,7 @@ import { withSymbolLeverage } from "../src/core/plan";
 import type { SymbolRules } from "../src/core/types";
 import { activeRules } from "../src/rules/rules";
 import { checkCoinIsFree, checkNewSetRisk, parseAccountRisk, type RiskVerdict } from "../src/core/risk";
+import { parseOpenOrders } from "./intents";
 import { formatToStep, isOnStep } from "../src/core/rounding";
 import { cleanRatio, planHeadline, remeasureAfterFill } from "../src/core/takeProfit";
 import {
@@ -337,7 +338,9 @@ export async function preTradeCheck(
 ): Promise<{ ok: true; ledger: SetLedger; risk: RiskVerdict } | { ok: false; message: string; risk?: RiskVerdict }> {
   const symbol = rules.symbol;
   const ledger = ctx.ledger;
-  const free = checkCoinIsFree({ symbol, positionAmts: ctx.rows.map((r) => r.positionAmt), liveSetIds: activeSets(ledger, symbol).map((s) => s.id) });
+  // Open orders on the coin: a resting Wick Catcher order (wc_) makes the coin busy (server/intents.ts, 2026-11-25).
+  const openIds = parseOpenOrders(await client.openOrders(symbol)).map((o) => o.clientOrderId);
+  const free = checkCoinIsFree({ symbol, positionAmts: ctx.rows.map((r) => r.positionAmt), liveSetIds: activeSets(ledger, symbol).map((s) => s.id), openOrderClientIds: openIds });
   if (!free.ok) return { ok: false, message: free.message };
   const account = parseAccountRisk(await client.account());
   const margin = checkMarginForSet({ ledger, ticketUsd: plan.input.ticketUsd, availableBalanceUsd: account.availableBalanceUsd, walletBalanceUsd: account.equityUsd });

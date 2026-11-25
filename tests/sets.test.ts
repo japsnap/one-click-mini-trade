@@ -94,8 +94,8 @@ interface OtherCoin {
   markPrice: number;
 }
 
-function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?: number; available?: number; others?: OtherCoin[]; symbol?: string; failTakeProfitUpdate?: boolean }) {
-  const state = { ...init, wallet: init.wallet ?? 1000, available: init.available ?? 1000, others: init.others ?? [], symbol: init.symbol ?? "BTCUSDT" };
+function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?: number; available?: number; others?: OtherCoin[]; symbol?: string; failTakeProfitUpdate?: boolean; openOrders?: Array<Record<string, string>> }) {
+  const state = { ...init, wallet: init.wallet ?? 1000, available: init.available ?? 1000, others: init.others ?? [], symbol: init.symbol ?? "BTCUSDT", openOrders: init.openOrders ?? [] };
   const calls: Array<{ method: string; path: string; params: URLSearchParams }> = [];
   let nextStrategy = 100;
   const json = (x: unknown, status = 200) => new Response(JSON.stringify(x), { status });
@@ -107,6 +107,9 @@ function fakeAster(init: { dual: boolean; leverage: number; rows: Row[]; wallet?
     switch (`${method} ${u.pathname}`) {
       case "GET /fapi/v3/positionSide/dual":
         return json({ dualSidePosition: state.dual });
+      case "GET /fapi/v3/openOrders":
+        // the coin's open orders (V3 "Current All Open Orders"); a wc_ order makes the coin busy (2026-11-25)
+        return json(state.openOrders);
       case "GET /fapi/v3/positionRisk":
         return json(
           state.rows.map((r) => ({

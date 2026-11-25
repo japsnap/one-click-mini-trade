@@ -16,6 +16,8 @@
  *   GET  /api/sets                        every Set in the ledger with its status and its own profit
  *   GET  /api/rules                       the active rule set and the file it came from
  *   GET  /api/health                      mode and which settings are present (no values)
+ *   /api/wc/...                           Wick Catcher's own routes (server/intents.ts), token-guarded,
+ *                                         their own $5 cap; never used by the card
  *
  * Live Sets are recorded in a Set ledger (src/core/ledger.ts), kept here in
  * logs/set-ledger.json. In live mode the server also runs the watcher (server/watch.ts):
@@ -41,6 +43,7 @@ import { newSetId } from "../src/core/ledger";
 import { fileLedgerStore } from "./ledgerFile";
 import { loadRulesFile, type LoadedRules } from "./rules";
 import { fileWatchLog, SetWatcher } from "./watch";
+import { createWcRoutes, defaultTokenFile, readTokenFile } from "./intents";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -108,6 +111,28 @@ const levelsSource = new HyperliquidLevelSource({
 
 /** The Set ledger of this server's one account (server/ledgerFile.ts). */
 const ledgerStore = fileLedgerStore(path.join(ROOT, "logs", "set-ledger.json"));
+
+/**
+ * Wick Catcher's routes (/api/wc/, server/intents.ts): their own cap WC_MAX_TICKET_USD (default 5),
+ * the token from the file WC_INTENT_TOKEN_FILE (default ~/wick-data/engine/intent.token), and
+ * their own counter logs/wc-entries.json. The card's cap MAX_LIVE_TICKET_USD is not touched.
+ */
+const wcCapRaw = process.env.WC_MAX_TICKET_USD?.trim() || "5";
+const wcCap = Number(wcCapRaw);
+if (!Number.isFinite(wcCap) || wcCap <= 0 || wcCap > 10) {
+  console.error("[wc] WC_MAX_TICKET_USD must be a number above 0 and at most 10");
+  process.exit(1);
+}
+const wcTokenFile = defaultTokenFile(process.env);
+const wcRoutes = createWcRoutes({
+  client: aster,
+  loadLedger: () => ledgerStore.load(),
+  counterFile: path.join(ROOT, "logs", "wc-entries.json"),
+  token: readTokenFile(wcTokenFile),
+  maxTicketUsd: wcCap,
+  liveTrading: cfg.liveTrading,
+});
+console.log(`[wc] routes /api/wc/: cap $${wcCap}, token file ${readTokenFile(wcTokenFile) ? "found" : "missing (routes closed)"}`);
 
 /** Cryptographic random in [0, 1) for the price nudge. */
 const random = () => randomInt(0, 2 ** 31) / 2 ** 31;
@@ -244,6 +269,7 @@ const server = createServer(async (req, res) => {
       // Refused = nothing was sent (the coin already holds a position or a Set, balance, liquidation rules).
       return send(res, result.ok ? 200 : result.refused ? 409 : 502, { status, trial: false, plan, result });
     }
+    if (await wcRoutes.handle(req, res, url, readJson)) return;
     return send(res, 404, { error: "not found" });
   } catch (e) {
     const err = e as Error;

@@ -167,11 +167,14 @@ const pct = (x: number) => `${Math.round(x * 100)}%`;
  * Never merge: the coin must hold no open position (any side, the user's own or a Set's)
  * and no live Set (pending or open) in the ledger. Pure. The message is plain, for the card.
  */
-export function checkCoinIsFree(args: { symbol: string; positionAmts: number[]; liveSetIds: string[] }): { ok: true } | { ok: false; message: string } {
+export function checkCoinIsFree(args: { symbol: string; positionAmts: number[]; liveSetIds: string[]; openOrderClientIds?: string[] }): { ok: true } | { ok: false; message: string } {
   const coin = args.symbol.replace(/USDT$/, "");
   const why = "A Set never shares a coin with another position, so nothing was sent.";
   if (args.positionAmts.some((a) => a !== 0)) return { ok: false, message: `${coin} already has an open position. ${why}` };
   if (args.liveSetIds.length > 0) return { ok: false, message: `${coin} already has a live Set (${args.liveSetIds.join(", ")}). ${why}` };
+  // Wick Catcher's resting orders (client ids starting wc_, server/intents.ts) make the coin busy too (2026-11-25).
+  const wc = (args.openOrderClientIds ?? []).filter((id) => id.startsWith("wc_"));
+  if (wc.length > 0) return { ok: false, message: `${coin} has a resting Wick Catcher order (${wc.join(", ")}). ${why}` };
   return { ok: true };
 }
 
