@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-28 (later): no change here for Wick Catcher's fast trigger
+
+- Wick Catcher's engine (its plan 12.9) now also places bids from its fast trigger and, behind a switch that is off, from pre-set zones. Both go through the same `POST /api/wc/place` with the same guards; no route, guard or cap changed and the server was not restarted. Read for the plan's question: the place route sends one OTOCO strategy order, so the take-profit and the stop rest on the venue together with the bid and stay there if the engine is down when the bid fills. 270 tests pass.
+
 ## 2026-11-28: Wick Catcher's Multi-Assets routes, its cap raised to $12
 
 - New routes (token-guarded like the other /api/wc/ routes): `GET /api/wc/multi-assets` (the account's Multi-Assets mode from GET /fapi/v3/multiAssetsMargin and the non-zero asset balances) and `POST /api/wc/multi-assets-off` (POST /fapi/v3/multiAssetsMargin multiAssetsMargin=false, the V3 doc's endpoint; only with LIVE_TRADING, no position and no open order on any symbol and no live Set; reads the mode before, switches, reads it back; an Aster refusal answers 502 with its code). New AsterClient calls `multiAssetsMode`, `setMultiAssetsMode`, `openOrdersAll`. Not used yet: the account's wallet is USDT 3.01 and USDC 12.87, and Single-Asset mode counts only USDT, so switching would leave $3 of margin for the $12 trade; the engine runs on cross with its stop, as Shota allowed.
