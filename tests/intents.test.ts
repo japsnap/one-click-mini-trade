@@ -24,8 +24,9 @@ const exchangeInfo = JSON.parse(readFileSync(path.join(__dirname, "fixtures", "a
 
 interface FakeOrder { orderId: number; clientOrderId: string; type: string; side: string; price: string; stopPrice: string; origQty: string; reduceOnly: string; status: string; executedQty: string; avgPrice: string }
 
-function fakeVenue(init: { positionAmt?: number; leverage?: number; foreign?: boolean; failNewStop?: boolean; readBackMissing?: boolean; marginType?: string } = {}) {
-  const st = { positionAmt: init.positionAmt ?? 0, leverage: init.leverage ?? 30, marginType: init.marginType ?? "cross", orders: [] as FakeOrder[], done: [] as FakeOrder[] };
+function fakeVenue(init: { positionAmt?: number; leverage?: number; foreign?: boolean; failNewStop?: boolean; readBackMissing?: boolean; marginType?: string; multiAssets?: boolean; ethPosition?: number; ethOrder?: boolean; refuseMultiOff?: boolean; ignoreMultiOff?: boolean } = {}) {
+  const st = { positionAmt: init.positionAmt ?? 0, leverage: init.leverage ?? 30, marginType: init.marginType ?? "cross", orders: [] as FakeOrder[], done: [] as FakeOrder[], multiAssets: init.multiAssets ?? true };
+  const ethOrders: Array<FakeOrder & { symbol: string }> = init.ethOrder ? [{ symbol: "ETHUSDT", orderId: 9, clientOrderId: "set_eth", type: "LIMIT", side: "BUY", price: "2000", stopPrice: "0", origQty: "0.01", reduceOnly: "false", status: "NEW", executedQty: "0", avgPrice: "0" }] : [];
   let nextId = 1000;
   if (init.foreign) st.orders.push({ orderId: nextId++, clientOrderId: "web_abc", type: "LIMIT", side: "BUY", price: "50000", stopPrice: "0", origQty: "0.001", reduceOnly: "false", status: "NEW", executedQty: "0", avgPrice: "0" });
   const calls: Array<{ method: string; path: string; params: URLSearchParams }> = [];
@@ -38,10 +39,22 @@ function fakeVenue(init: { positionAmt?: number; leverage?: number; foreign?: bo
     switch (`${method} ${u.pathname}`) {
       case "GET /fapi/v3/exchangeInfo":
         return json(exchangeInfo);
-      case "GET /fapi/v3/positionRisk":
-        return json([{ symbol: "BTCUSDT", positionSide: "BOTH", positionAmt: String(st.positionAmt), entryPrice: "59000", liquidationPrice: "56300", markPrice: "59100", leverage: String(st.leverage), marginType: st.marginType }]);
+      case "GET /fapi/v3/positionRisk": {
+        // with a symbol: that symbol's row; without (Aster V3 doc): every symbol's row
+        const btc = { symbol: "BTCUSDT", positionSide: "BOTH", positionAmt: String(st.positionAmt), entryPrice: "59000", liquidationPrice: "56300", markPrice: "59100", leverage: String(st.leverage), marginType: st.marginType };
+        const eth = { symbol: "ETHUSDT", positionSide: "BOTH", positionAmt: String(init.ethPosition ?? 0), entryPrice: "2000", liquidationPrice: "0", markPrice: "2000", leverage: "30", marginType: "cross" };
+        return json(params.get("symbol") ? [btc] : [btc, eth]);
+      }
       case "GET /fapi/v3/openOrders":
-        return json(st.orders);
+        return json(params.get("symbol") ? st.orders : [...st.orders, ...ethOrders]);
+      case "GET /fapi/v3/multiAssetsMargin":
+        return json({ multiAssetsMargin: st.multiAssets });
+      case "POST /fapi/v3/multiAssetsMargin":
+        if (init.refuseMultiOff) return json({ code: -4167, msg: "Unable to adjust to Multi-Assets mode with symbols of USDⓈ-M Futures under isolated-margin mode." }, 400);
+        if (!init.ignoreMultiOff) st.multiAssets = params.get("multiAssetsMargin") === "true";
+        return json({ code: 200, msg: "success" });
+      case "GET /fapi/v3/balance":
+        return json([{ asset: "USDT", balance: "15.89", availableBalance: "15.89", marginAvailable: true }, { asset: "USDF", balance: "0", availableBalance: "0" }]);
       case "GET /fapi/v3/account":
         return json({ availableBalance: "12", totalPositionInitialMargin: "0", totalOpenOrderInitialMargin: "0", totalMaintMargin: "0", positions: [] });
       case "GET /fapi/v3/leverageBrackets":
@@ -259,6 +272,63 @@ describe("Wick Catcher routes: move-stop keeps a stop at every moment (HYBRID)",
     expect(String(out.body.message)).toMatch(/old stop wc_t1-S was kept/);
     expect(v.sent("DELETE", "/fapi/v3/order")).toHaveLength(0);
   });
+});
+
+describe("Wick Catcher routes: Multi-Assets mode off (HYBRID, 2026-11-28)", () => {
+  const changes = (v: ReturnType<typeof fakeVenue>) => v.sent("POST", "/fapi/v3/multiAssetsMargin");
+  it("reads the mode, switches it off with multiAssetsMargin=false, reads it back", async () => {
+    const v = fakeVenue();
+    const { r } = routes(v);
+    const read = await call(r, "GET", "/api/wc/multi-assets");
+    expect(read.status).toBe(200);
+    expect(read.body.multiAssetsMargin).toBe(true);
+    expect(read.body.balances).toEqual([{ asset: "USDT", balance: 15.89, availableBalance: 15.89, marginAvailable: true }]);
+    const out = await call(r, "POST", "/api/wc/multi-assets-off");
+    expect(out.status).toBe(200);
+    expect(out.body).toMatchObject({ status: "single-asset", before: true, after: false });
+    expect(changes(v)).toHaveLength(1);
+    expect(changes(v)[0]!.params.get("multiAssetsMargin")).toBe("false");
+    expect(v.st.multiAssets).toBe(false);
+    // the read-back is a second GET after the change, never the change's own answer
+    const gets = v.calls.map((c, i) => [c.method + " " + c.path, i] as const).filter(([k]) => k.endsWith("/multiAssetsMargin"));
+    expect(gets.map(([k]) => k)).toEqual(["GET /fapi/v3/multiAssetsMargin", "GET /fapi/v3/multiAssetsMargin", "POST /fapi/v3/multiAssetsMargin", "GET /fapi/v3/multiAssetsMargin"]);
+  });
+  it("already single-asset: nothing is sent", async () => {
+    const v = fakeVenue({ multiAssets: false });
+    const out = await call(routes(v).r, "POST", "/api/wc/multi-assets-off");
+    expect(out.body).toMatchObject({ status: "already single-asset", before: false, after: false });
+    expect(changes(v)).toHaveLength(0);
+  });
+  it("a change Aster ignores is reported, never called done", async () => {
+    const v = fakeVenue({ ignoreMultiOff: true });
+    const out = await call(routes(v).r, "POST", "/api/wc/multi-assets-off");
+    expect(out.body).toMatchObject({ status: "still multi-assets after the change", after: true });
+  });
+  it("Aster's refusal comes back with its code and message (502)", async () => {
+    const v = fakeVenue({ refuseMultiOff: true });
+    const out = await call(routes(v).r, "POST", "/api/wc/multi-assets-off");
+    expect(out.status).toBe(502);
+    expect(String(out.body.error)).toMatch(/code -4167/);
+    expect(v.st.multiAssets).toBe(true);
+  });
+  const refusals: Array<[string, () => ReturnType<typeof fakeVenue>, Partial<Parameters<typeof routes>[1]>, RegExp]> = [
+    ["a position on another symbol (ETH)", () => fakeVenue({ ethPosition: 0.05 }), {}, /positions on ETHUSDT/],
+    ["a position on BTC", () => fakeVenue({ positionAmt: 0.001 }), {}, /positions on BTCUSDT/],
+    ["an open order on another symbol", () => fakeVenue({ ethOrder: true }), {}, /1 open order/],
+    ["a live Set on any symbol", () => fakeVenue(), { ledger: { version: 1, sets: [{ id: "set_eth", symbol: "ETHUSDT", status: "pending" }] } as unknown as SetLedger }, /Set is live \(set_eth\)/],
+    ["LIVE_TRADING off", () => fakeVenue(), { live: false }, /LIVE_TRADING is not true/],
+    ["a wrong token", () => fakeVenue(), { token: "y".repeat(40) }, /Wrong or missing/],
+  ];
+  for (const [name, mk, opts, msg] of refusals) {
+    it(`refuses and changes nothing: ${name} (negative)`, async () => {
+      const v = mk();
+      const out = await call(routes(v, opts).r, "POST", "/api/wc/multi-assets-off");
+      expect(out.status).toBe(409);
+      expect(String(out.body.message)).toMatch(msg);
+      expect(changes(v)).toHaveLength(0);
+      expect(v.st.multiAssets).toBe(true);
+    });
+  }
 });
 
 describe("the card never shares BTC with a resting Wick Catcher order", () => {

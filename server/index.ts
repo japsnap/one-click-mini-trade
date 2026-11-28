@@ -113,14 +113,15 @@ const levelsSource = new HyperliquidLevelSource({
 const ledgerStore = fileLedgerStore(path.join(ROOT, "logs", "set-ledger.json"));
 
 /**
- * Wick Catcher's routes (/api/wc/, server/intents.ts): their own cap WC_MAX_TICKET_USD (default 5),
+ * Wick Catcher's routes (/api/wc/, server/intents.ts): their own cap WC_MAX_TICKET_USD (default 12 since
+ * 2026-11-28, Shota: "just use maybe 12 dollars for the next trade"; was 5; at most 12),
  * the token from the file WC_INTENT_TOKEN_FILE (default ~/wick-data/engine/intent.token), and
  * their own counter logs/wc-entries.json. The card's cap MAX_LIVE_TICKET_USD is not touched.
  */
-const wcCapRaw = process.env.WC_MAX_TICKET_USD?.trim() || "5";
+const wcCapRaw = process.env.WC_MAX_TICKET_USD?.trim() || "12";
 const wcCap = Number(wcCapRaw);
-if (!Number.isFinite(wcCap) || wcCap <= 0 || wcCap > 10) {
-  console.error("[wc] WC_MAX_TICKET_USD must be a number above 0 and at most 10");
+if (!Number.isFinite(wcCap) || wcCap <= 0 || wcCap > 12) {
+  console.error("[wc] WC_MAX_TICKET_USD must be a number above 0 and at most 12");
   process.exit(1);
 }
 const wcTokenFile = defaultTokenFile(process.env);

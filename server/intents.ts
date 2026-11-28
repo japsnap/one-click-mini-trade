@@ -5,7 +5,7 @@
  * order form (a limit entry whose fill places a reduce-only take-profit and a reduce-only stop
  * on the mark price, one OTOCO) is reused. The card's own route POST /api/set/place is never
  * used by Wick Catcher and its cap (MAX_LIVE_TICKET_USD) is untouched; these routes carry their
- * own cap, WC_MAX_TICKET_USD (default 5).
+ * own cap, WC_MAX_TICKET_USD (default 12 since 2026-11-28; was 5).
  *
  * Routes (every one needs the header x-wc-token, the token in the file WC_INTENT_TOKEN_FILE,
  * default ~/wick-data/engine/intent.token, written by `python3 -m wc token`, never printed):
@@ -17,6 +17,10 @@
  *   POST /api/wc/move-stop   { oldClientOrderId, newClientOrderId, stopPrice, quantity }: the new
  *                            reduce-only stop first, read back, then the old one cancelled
  *   POST /api/wc/isolated    switch BTCUSDT to isolated margin once, only with nothing open on BTC
+ *   GET  /api/wc/multi-assets      the account's Multi-Assets mode and its non-zero asset balances (read only)
+ *   POST /api/wc/multi-assets-off  Single-Asset mode for the whole account (added 2026-11-28, Shota's yes: Aster
+ *                            refuses isolated margin under Multi-Assets, code -4168). Only with no position and no
+ *                            open order on ANY symbol and no live Set; reads the mode before, switches, reads back.
  * Guards inside the server: the token, BTCUSDT only, 20x only, margin at or under the cap, never
  * merge (no position on BTC, no order that is not wc_, no live Set), and one trade: the counter
  * file logs/wc-entries.json refuses a new entry once one entry has filled. A refusal answers 409
@@ -47,6 +51,10 @@ export interface WcClient {
   leverageBrackets(symbol: string): Promise<LeverageBracket[]>;
   changeLeverage(symbol: string, leverage: number): Promise<unknown>;
   ensureIsolated(symbol: string): Promise<void>;
+  multiAssetsMode(): Promise<boolean>;
+  setMultiAssetsMode(on: boolean): Promise<unknown>;
+  openOrdersAll(): Promise<unknown>;
+  balance(): Promise<unknown>;
   placeOtoco(entry: StrategySubOrder, takeProfit: StrategySubOrder, stop: StrategySubOrder, clientStrategyId?: string): Promise<unknown>;
   cancelOrderByClientId(symbol: string, clientOrderId: string): Promise<unknown>;
   newOrder(p: NewOrderParams): Promise<unknown>;
@@ -350,6 +358,39 @@ export function createWcRoutes(deps: WcDeps) {
     return { status: after.marginType === "isolated" ? "isolated" : `margin mode reads ${after.marginType} after the change`, marginType: after.marginType };
   }
 
+  /** Non-zero asset rows of GET /fapi/v3/balance: amounts only, so a report shows where the wallet sits. */
+  async function balances() {
+    const rows = await c.balance();
+    if (!Array.isArray(rows)) throw new Error("balance: answer is not a list");
+    const n = (v: unknown) => (typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : Number.NaN);
+    return (rows as Array<Record<string, unknown>>)
+      .map((r) => ({ asset: String(r.asset ?? ""), balance: n(r.balance), availableBalance: n(r.availableBalance), marginAvailable: r.marginAvailable ?? null }))
+      .filter((r) => Number.isFinite(r.balance) && r.balance !== 0);
+  }
+
+  async function multiAssets() {
+    return { multiAssetsMargin: await c.multiAssetsMode(), balances: await balances() };
+  }
+
+  /** The mode changes every symbol, so the guard is account wide: no position, no open order, no live Set anywhere. */
+  async function multiAssetsOff() {
+    if (!deps.liveTrading) refuse("LIVE_TRADING is not true on this server, so the margin mode was not changed.");
+    const before = await c.multiAssetsMode();
+    const bal = await balances();
+    if (!before) return { status: "already single-asset", before, after: before, balances: bal };
+    const posRaw = await c.positionRisk();
+    const pos = (Array.isArray(posRaw) ? posRaw : [posRaw]) as Array<Record<string, unknown>>;
+    const open = pos.filter((r) => Number(r?.positionAmt ?? 0) !== 0).map((r) => String(r.symbol));
+    if (open.length > 0) refuse(`The account holds positions on ${open.join(", ")}, so the Multi-Assets mode was not changed.`);
+    const orders = parseOpenOrders(await c.openOrdersAll());
+    if (orders.length > 0) refuse(`The account has ${orders.length} open order(s), so the Multi-Assets mode was not changed.`);
+    const live = activeSets(await deps.loadLedger()).map((x) => x.id);
+    if (live.length > 0) refuse(`A Set is live (${live.join(", ")}), so the Multi-Assets mode was not changed.`);
+    await c.setMultiAssetsMode(false);
+    const after = await c.multiAssetsMode();
+    return { status: after === false ? "single-asset" : "still multi-assets after the change", before, after, balances: await balances() };
+  }
+
   async function handle(req: IncomingMessage, res: ServerResponse, url: URL, readJson: (r: IncomingMessage) => Promise<unknown>): Promise<boolean> {
     if (!url.pathname.startsWith("/api/wc/")) return false;
     const send = (status: number, body: unknown) => {
@@ -362,12 +403,14 @@ export function createWcRoutes(deps: WcDeps) {
       if (typeof got !== "string" || !sameToken(got, deps.token)) refuse("Wrong or missing Wick Catcher token, so nothing was done.");
       const route = `${req.method} ${url.pathname}`;
       if (route === "GET /api/wc/state") return send(200, await locked(state)), true;
+      if (route === "GET /api/wc/multi-assets") return send(200, await locked(multiAssets)), true;
       const body = req.method === "POST" ? ((await readJson(req)) as Record<string, unknown>) : {};
       if (route === "POST /api/wc/place") return send(200, await locked(() => place(body))), true;
       if (route === "POST /api/wc/cancel") return send(200, await locked(() => cancel(body))), true;
       if (route === "POST /api/wc/close") return send(200, await locked(() => close(body))), true;
       if (route === "POST /api/wc/move-stop") return send(200, await locked(() => moveStop(body))), true;
       if (route === "POST /api/wc/isolated") return send(200, await locked(isolated)), true;
+      if (route === "POST /api/wc/multi-assets-off") return send(200, await locked(multiAssetsOff)), true;
       send(404, { error: "not found" });
       return true;
     } catch (e) {
@@ -382,5 +425,5 @@ export function createWcRoutes(deps: WcDeps) {
     }
   }
 
-  return { handle, state, place, cancel, close, moveStop, isolated, refreshCounter };
+  return { handle, state, place, cancel, close, moveStop, isolated, multiAssets, multiAssetsOff, refreshCounter };
 }

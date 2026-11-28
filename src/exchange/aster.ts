@@ -692,6 +692,32 @@ export class AsterClient {
     }
   }
 
+  /**
+   * GET /fapi/v3/multiAssetsMargin (V3 doc "Get Current Multi-Assets Mode", weight 30): true = Multi-Assets
+   * Mode, false = Single-Asset Mode, for every symbol of the account. Answers that are neither are refused.
+   */
+  async multiAssetsMode(): Promise<boolean> {
+    const j = (await this.signed("GET", "/fapi/v3/multiAssetsMargin", [])) as { multiAssetsMargin?: unknown };
+    const v = j?.multiAssetsMargin;
+    if (v === true || v === "true") return true;
+    if (v === false || v === "false") return false;
+    throw new Error(`multiAssetsMargin: answer holds no true or false (${JSON.stringify(j).slice(0, 120)})`);
+  }
+
+  /**
+   * POST /fapi/v3/multiAssetsMargin (V3 doc "Change Multi-Assets Mode"): changes every symbol of the account.
+   * Used only by Wick Catcher's route POST /api/wc/multi-assets-off (server/intents.ts), added 2026-11-28 on
+   * Shota's yes, so that isolated margin can be set on BTC.
+   */
+  setMultiAssetsMode(on: boolean) {
+    return this.signed("POST", "/fapi/v3/multiAssetsMargin", [["multiAssetsMargin", on ? "true" : "false"]]);
+  }
+
+  /** GET /fapi/v3/openOrders without a symbol: every open order of the account (V3 doc: weight 40). */
+  openOrdersAll() {
+    return this.signed("GET", "/fapi/v3/openOrders", []);
+  }
+
   /** GET /fapi/v3/positionSide/dual. true = Hedge Mode (positionSide must be sent, reduceOnly must not). */
   async isHedgeMode(): Promise<boolean> {
     const j = (await this.signed("GET", "/fapi/v3/positionSide/dual", [])) as { dualSidePosition?: unknown };
